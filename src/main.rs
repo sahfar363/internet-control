@@ -1,12 +1,15 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.1.
+//! Internet Control — usage meter v0.2.
 //!
-//! Windows 10/11 x64. Lists all network adapters, polls their 64-bit
-//! octet counters every 100 ms, and shows real download/upload for the
-//! selected adapter. No admin rights needed for the meter.
+//! Windows 10/11 x64. Counts real download/upload by capturing packets
+//! with WinDivert (sniff mode) — the standard adapter counters never
+//! move on PDAnet PPP adapters, so packet counting is the only way.
+//! Falls back to the v0.1 counter mode if WinDivert cannot be opened.
+//! Administrator rights are required in v0.2 (WinDivert driver).
 
 mod adapters;
 mod app;
+mod capture;
 mod meter;
 mod store;
 

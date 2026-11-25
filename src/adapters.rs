@@ -7,12 +7,23 @@
 //! WiFi and Ethernet, because on a tethered setup the virtual adapter is
 //! the one carrying the internet.
 //!
+//! v0.2 measurement: the counters are only a fallback. The sampler first
+//! tries WinDivert packet capture (`crate::capture`); on Sahand's PC the
+//! PDAnet PPP adapter's counters never move, so counting packets is the
+//! only way to see the traffic. Capture totals are cumulative per
+//! interface index, so the same `RateCalculator` math turns them into
+//! rates — and the `Total` column shows captured bytes instead of the
+//! frozen 0. If an interface index has no matching adapter, its traffic
+//! is shown as an "Unknown interface N" row so the top numbers never
+//! read 0 while packets are flowing.
+//!
 //! Non-Windows builds provide stubs so `cargo test` runs on Linux.
 
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use crate::capture::{CaptureSnapshot, CaptureStatus};
 use crate::meter::RateCalculator;
 
 #[allow(dead_code)] // fields are read by the UI on Windows; stubs on Linux
@@ -47,6 +58,9 @@ pub struct AdapterReading {
 pub struct SampleBatch {
     pub adapters: Vec<AdapterReading>,
     pub at: Option<Instant>,
+    /// How these numbers were measured (WinDivert capture, or the v0.1
+    /// counter fallback with the reason capture is unavailable).
+    pub capture_status: CaptureStatus,
 }
 
 #[allow(dead_code)] // used by the Windows enumeration path
@@ -293,37 +307,141 @@ pub fn default_route_luid() -> Option<u64> {
     None
 }
 
+/// LUIDs for synthetic "Unknown interface N" rows. Real LUIDs never
+/// carry this prefix (ASCII "WDIV" in the high bytes), so a captured
+/// interface with no matching adapter can still be selected and shown.
+fn synthetic_luid(if_index: u32) -> u64 {
+    0x5744_4956_0000_0000u64 | if_index as u64
+}
+
 /// Background sampler: polls every 100 ms, computes per-adapter rates,
 /// and sends a batch to the UI. Runs until the receiver is dropped.
+///
+/// Measurement source, in order:
+/// 1. WinDivert packet capture (v0.2 default) — per-interface cumulative
+///    byte totals from the capture thread, turned into rates with the
+///    same `RateCalculator` as the counters. Session totals from these
+///    deltas are exact; live rates can jitter by one tick because a
+///    snapshot may land between ticks.
+/// 2. Adapter counters (v0.1 fallback) — used only when WinDivert could
+///    not be opened, e.g. not run as administrator or driver files
+///    missing. The reason is carried in every batch for the UI.
 pub fn sample_loop(tx: Sender<SampleBatch>) {
-    let mut calculators: HashMap<u64, RateCalculator> = HashMap::new();
+    let capture = crate::capture::try_start();
+    let mut capture_rx: Option<Receiver<CaptureSnapshot>> = capture.rx;
+    let mut capture_status = capture.status;
+    let mut last_snapshot: Option<CaptureSnapshot> = None;
+    // Rate calculators keyed by interface index (capture mode).
+    let mut capture_calcs: HashMap<u32, RateCalculator> = HashMap::new();
+    // Rate calculators keyed by LUID (counter fallback mode).
+    let mut counter_calcs: HashMap<u64, RateCalculator> = HashMap::new();
     let mut last = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(100));
         let now = Instant::now();
         let elapsed = now.duration_since(last).as_secs_f64();
         last = now;
+
+        // Drain capture snapshots, keep the latest.
+        if let Some(rx) = &capture_rx {
+            while let Ok(snap) = rx.try_recv() {
+                last_snapshot = Some(snap);
+            }
+            if let Err(std::sync::mpsc::TryRecvError::Disconnected) = rx.try_recv() {
+                capture_status = CaptureStatus::Unavailable(
+                    "WinDivert capture stopped unexpectedly. \
+                     Showing adapter counters (fallback)."
+                        .to_string(),
+                );
+                capture_rx = None;
+            }
+        }
+        if let Some(snap) = &last_snapshot {
+            if capture_status.is_active() {
+                capture_status = CaptureStatus::Active {
+                    packets: snap.packets,
+                };
+            }
+        }
+
         let adapters = enumerate_adapters();
         let mut readings = Vec::with_capacity(adapters.len());
-        for info in adapters {
-            let calc = calculators.entry(info.luid).or_default();
-            let s = calc.update(info.in_octets, info.out_octets, elapsed);
-            readings.push(AdapterReading {
-                info,
-                down_bps: s.down_bps,
-                up_bps: s.up_bps,
-                down_delta: s.down_delta,
-                up_delta: s.up_delta,
-            });
+        if capture_status.is_active() {
+            let snap = last_snapshot.clone().unwrap_or_default();
+            for info in &adapters {
+                let totals = snap.totals.get(&info.index).copied().unwrap_or_default();
+                let calc = capture_calcs.entry(info.index).or_default();
+                let s = calc.update(totals.down_bytes, totals.up_bytes, elapsed);
+                let mut info = info.clone();
+                // Total column shows captured bytes, not the frozen
+                // standard counters.
+                info.in_octets = totals.down_bytes;
+                info.out_octets = totals.up_bytes;
+                readings.push(AdapterReading {
+                    info,
+                    down_bps: s.down_bps,
+                    up_bps: s.up_bps,
+                    down_delta: s.down_delta,
+                    up_delta: s.up_delta,
+                });
+            }
+            // Interfaces WinDivert sees but GetIfTable2 does not list:
+            // show them as their own row instead of dropping the bytes.
+            for (idx, totals) in &snap.totals {
+                if totals.down_bytes == 0 && totals.up_bytes == 0 {
+                    continue;
+                }
+                if adapters.iter().any(|a| a.index == *idx) {
+                    continue;
+                }
+                let calc = capture_calcs.entry(*idx).or_default();
+                let s = calc.update(totals.down_bytes, totals.up_bytes, elapsed);
+                readings.push(AdapterReading {
+                    info: AdapterInfo {
+                        luid: synthetic_luid(*idx),
+                        index: *idx,
+                        name: format!("Unknown interface {idx}"),
+                        type_name: "Unknown".to_string(),
+                        oper_status: 1,
+                        status_text: "Up".to_string(),
+                        in_octets: totals.down_bytes,
+                        out_octets: totals.up_bytes,
+                        ..Default::default()
+                    },
+                    down_bps: s.down_bps,
+                    up_bps: s.up_bps,
+                    down_delta: s.down_delta,
+                    up_delta: s.up_delta,
+                });
+            }
+            // Drop calculators for interfaces that disappeared, so a
+            // reappearing interface re-baselines instead of spiking.
+            let live: std::collections::HashSet<u32> =
+                readings.iter().map(|r| r.info.index).collect();
+            capture_calcs.retain(|idx, _| live.contains(idx));
+        } else {
+            for info in adapters {
+                let calc = counter_calcs.entry(info.luid).or_default();
+                let s = calc.update(info.in_octets, info.out_octets, elapsed);
+                readings.push(AdapterReading {
+                    info,
+                    down_bps: s.down_bps,
+                    up_bps: s.up_bps,
+                    down_delta: s.down_delta,
+                    up_delta: s.up_delta,
+                });
+            }
+            // Drop calculators for adapters that disappeared, so a reappearing
+            // adapter re-baselines instead of producing a bogus delta.
+            let live: std::collections::HashSet<u64> =
+                readings.iter().map(|r| r.info.luid).collect();
+            counter_calcs.retain(|luid, _| live.contains(luid));
         }
-        // Drop calculators for adapters that disappeared, so a reappearing
-        // adapter re-baselines instead of producing a bogus delta.
-        let live: std::collections::HashSet<u64> = readings.iter().map(|r| r.info.luid).collect();
-        calculators.retain(|luid, _| live.contains(luid));
         if tx
             .send(SampleBatch {
                 adapters: readings,
                 at: Some(now),
+                capture_status: capture_status.clone(),
             })
             .is_err()
         {

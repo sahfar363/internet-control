@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText, Stroke, Vec2};
 
 use crate::adapters::{default_route_luid, AdapterReading, SampleBatch};
+use crate::capture::CaptureStatus;
 use crate::meter::{format_bytes, format_rate};
 use crate::store::Store;
 
@@ -29,6 +30,9 @@ pub struct MeterApp {
     last_batch: Option<Instant>,
     last_save: Instant,
     error: Option<String>,
+    /// How the numbers are measured (WinDivert capture, or the counter
+    /// fallback with the reason). Shown under the heading.
+    capture_status: CaptureStatus,
 }
 
 impl MeterApp {
@@ -52,6 +56,7 @@ impl MeterApp {
             last_batch: None,
             last_save: Instant::now(),
             error: None,
+            capture_status: CaptureStatus::default(),
         }
     }
 
@@ -114,6 +119,7 @@ impl MeterApp {
     fn drain(&mut self) {
         while let Ok(batch) = self.rx.try_recv() {
             self.last_batch = Some(Instant::now());
+            self.capture_status = batch.capture_status.clone();
             self.adapters = batch.adapters;
             self.pick_default();
             // Copy the selected reading out first (borrow ends here) so
@@ -210,6 +216,14 @@ impl eframe::App for MeterApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(format!("Internet Control — Usage Meter  v{VERSION}"));
             ui.label(format!("Selected adapter: {}", self.selected_name()));
+            // Measurement source: green when WinDivert capture is live,
+            // yellow when it fell back to the (possibly frozen) counters.
+            let source = self.capture_status.label();
+            if self.capture_status.is_active() {
+                ui.label(RichText::new(source).color(Color32::from_rgb(120, 220, 130)));
+            } else {
+                ui.label(RichText::new(source).color(Color32::YELLOW));
+            }
             ui.add_space(4.0);
 
             ui.horizontal(|ui| {
@@ -321,7 +335,7 @@ impl eframe::App for MeterApp {
             }
             ui.add_space(4.0);
             ui.label(
-                "No admin rights needed for the meter. \
+                "Administrator rights are required in v0.2 (WinDivert driver). \
                  Verification: download a known 100 MB file — the session total \
                  should read ~100 MB, not 0 and not ~200 MB.",
             );

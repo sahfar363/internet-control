@@ -1,8 +1,8 @@
 [package]
 name = "internet-control"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.1). Lists all adapters, uses 64-bit counters polled every 100 ms, never double-counts VPN + tethering."
+description = "Internet Control — precise Windows internet usage meter (v0.2). Counts packets with WinDivert sniff capture, because PDAnet PPP adapters report 0 in the standard counters; falls back to 64-bit counters."
 license = "MIT"
 
 [dependencies]
@@ -19,6 +19,14 @@ windows = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_System_SystemInformation",
 ] }
+# WinDivert 2.2 driver wrapper (stable 0.6.0; 0.7.x is beta). Needs the
+# WinDivert 2.2.2 driver files at build time via WINDIVERT_PATH, and
+# WinDivert.dll + WinDivert64.sys next to the exe at runtime.
+windivert = "0.6"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# Embeds the requireAdministrator manifest (build.rs, Windows host only).
+winres = "0.1"
 
 [profile.release]
 opt-level = 3

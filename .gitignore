@@ -1,2 +1,6 @@
 /target/
 *.pdb
+# Local WinDivert driver downloads (never committed; the release
+# workflow downloads the official zip in CI instead).
+WinDivert*/
+windivert/
