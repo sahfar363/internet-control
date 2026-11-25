@@ -1,0 +1,38 @@
+# Release — Internet Control meter
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build Windows zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $version = (Get-Content Cargo.toml | Select-String '^version = "([^"]+)"').Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\internet-control.exe dist\
+          Copy-Item README.md dist\
+          Compress-Archive -Path dist\* -DestinationPath "internet-control-v$version-windows-x64.zip"
+          Get-FileHash "internet-control-v$version-windows-x64.zip" -Algorithm SHA256 | Format-List
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: internet-control-v*-windows-x64.zip
+          body: |
+            Internet Control meter v${{ github.ref_name }} — Windows x64.
+            Unzip and run `internet-control.exe`. No admin needed.
+            See README.md for the 100 MB verification test.
