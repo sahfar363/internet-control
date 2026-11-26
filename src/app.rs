@@ -7,13 +7,15 @@
 //! store + SetTcpEntry termination, as the old `/api/block` did).
 //!
 //! Layout (clean and minimal):
-//! * Top bar: title, Dark/Light theme toggle, Minimal toggle,
-//!   run-on-startup checkbox.
+//! * Top bar: title, opacity slider, Dark/Light theme toggle,
+//!   Minimal toggle, run-on-startup checkbox.
 //! * Big DOWNLOAD / UPLOAD rates + session totals + the carrying
 //!   adapter's name and IP — shown in BOTH normal and minimal view.
 //! * Tabs (full view): Overview (graph + totals + capture status),
 //!   Apps (per-app list with Block/Unblock), Adapters (adapter list
-//!   + diagnostics). Minimal view: top numbers + graph only.
+//!   + diagnostics). Minimal view (v0.7): the window itself shrinks
+//!     to a really small size — just the rates, the opacity slider and
+//!     the IP, no graph, no tabs.
 //! * Everything scrolls: the whole panel is a vertical ScrollArea,
 //!   so nothing is cut off when the window is short; the tables
 //!   scroll horizontally when the window is narrow. The window is
@@ -29,13 +31,26 @@ use std::time::Duration;
 use egui::{Color32, RichText, Stroke, Vec2};
 
 use crate::meter::{format_bytes, format_rate};
-use crate::state::{AppView, BlockState, Shared, SortMode, StateJson};
+use crate::opacity::{OPACITY_MAX, OPACITY_MIN};
+use crate::state::{
+    adapter_mode_after_click, AdapterSelection, AppView, BlockState, Shared, SortMode, StateJson,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Download blue / upload orange — the v0.2 colours, kept ever since.
 const DOWN_COLOR: Color32 = Color32::from_rgb(80, 180, 255);
 const UP_COLOR: Color32 = Color32::from_rgb(255, 170, 60);
+
+/// Really-small Minimal window (v0.7): just the rates, the opacity
+/// slider and the IP. The window itself shrinks to this size when
+/// Minimal is clicked — v0.6 only hid panels and left the window big.
+pub const MINIMAL_SIZE: [f32; 2] = [360.0, 190.0];
+/// Smallest the Minimal window can be dragged to.
+pub const MINIMAL_MIN_SIZE: [f32; 2] = [300.0, 150.0];
+/// Normal view size / minimum (set in `main.rs` too — keep in sync).
+pub const NORMAL_SIZE: [f32; 2] = [980.0, 720.0];
+pub const NORMAL_MIN_SIZE: [f32; 2] = [560.0, 420.0];
 
 /// Fixed widths (px) for the numeric columns: values never shift
 /// left/right as numbers change, because the column width is
@@ -89,15 +104,25 @@ pub struct MeterApp {
     shared: Arc<Shared>,
     tab: Tab,
     dark: bool,
+    /// Window opacity 0.2..=1.0 (v0.7), loaded from config.
+    opacity: f32,
+    /// Opacity the window currently has; `None` until first applied.
+    applied_opacity: Option<f32>,
+    /// Minimal state the window size currently reflects. Starts
+    /// false (the window opens at full size) — the first frame
+    /// shrinks it if the saved config says Minimal.
+    minimal: bool,
+    /// Last full-view window size, so leaving Minimal restores it.
+    normal_size: Option<Vec2>,
 }
 
 impl MeterApp {
     pub fn new(shared: Arc<Shared>, cc: &eframe::CreationContext<'_>) -> Self {
-        let dark = shared
+        let (dark, opacity) = shared
             .store
             .lock()
-            .map(|s| s.config.dark_theme)
-            .unwrap_or(true);
+            .map(|s| (s.config.dark_theme, s.config.opacity))
+            .unwrap_or((true, crate::opacity::OPACITY_DEFAULT));
         cc.egui_ctx.set_visuals(if dark {
             egui::Visuals::dark()
         } else {
@@ -107,6 +132,10 @@ impl MeterApp {
             shared,
             tab: Tab::Overview,
             dark,
+            opacity: crate::opacity::clamp_opacity(opacity),
+            applied_opacity: None,
+            minimal: false,
+            normal_size: None,
         }
     }
 
@@ -128,6 +157,40 @@ impl MeterApp {
         if let Ok(mut store) = self.shared.store.lock() {
             store.config.dark_theme = dark;
             store.save();
+        }
+    }
+
+    /// Save a new opacity (v0.7). The value is applied to the window
+    /// at the end of `update` (see `applied_opacity`), so the slider
+    /// only has to store it.
+    fn set_opacity(&mut self, value: f32) {
+        self.opacity = crate::opacity::clamp_opacity(value);
+        if let Ok(mut store) = self.shared.store.lock() {
+            store.config.opacity = self.opacity;
+            store.save();
+        }
+    }
+
+    /// Opacity slider (v0.7): 0.2..=1.0 with a percent label. Used in
+    /// the top bar (normal view) and under the rates (Minimal view).
+    fn opacity_slider(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.label("Opacity");
+        let resp = ui.add_sized(
+            Vec2::new(width, 18.0),
+            egui::Slider::new(&mut self.opacity, OPACITY_MIN..=OPACITY_MAX).show_value(false),
+        );
+        ui.label(format!("{:.0}%", self.opacity * 100.0));
+        if resp.changed() {
+            let value = self.opacity;
+            self.set_opacity(value);
+        }
+    }
+
+    /// Send a new adapter mode to the bridge (v0.7). It applies on
+    /// the next sample tick (~100 ms) and is saved to config.
+    fn set_adapter_mode(&mut self, mode: AdapterSelection) {
+        if let Ok(mut req) = self.shared.adapter_mode_request.lock() {
+            *req = Some(mode);
         }
     }
 
@@ -228,6 +291,37 @@ impl MeterApp {
         }
     }
 
+    /// The really-small Minimal view (v0.7): just the rates, the
+    /// opacity slider, and the IP underneath — no session totals, no
+    /// graph, no tabs. The window itself is ~360x190 at this point
+    /// (see `update`), so every line here has to earn its height.
+    fn draw_minimal(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("DOWNLOAD").small().color(Color32::GRAY));
+                ui.label(RichText::new(&snap.top.down).size(24.0).color(DOWN_COLOR));
+            });
+            ui.add_space(24.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("UPLOAD").small().color(Color32::GRAY));
+                ui.label(RichText::new(&snap.top.up).size(24.0).color(UP_COLOR));
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            // Label + percent take ~90px; the slider gets the rest.
+            let slider_w = (ui.available_width() - 90.0).max(60.0);
+            self.opacity_slider(ui, slider_w);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("IP: {}", snap.selected_ip)).strong());
+            ui.label(format!("  {}", snap.selected_name));
+        });
+        if let Some(note) = &snap.top.note {
+            ui.label(RichText::new(note).small().color(Color32::YELLOW));
+        }
+    }
+
     fn draw_graph(&self, ui: &mut egui::Ui, snap: &StateJson) {
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 120.0), egui::Sense::hover());
@@ -297,15 +391,26 @@ impl MeterApp {
             );
         }
         ui.add_space(4.0);
-        ui.label(
-            RichText::new(
+        // What the totals mean depends on the adapter mode (v0.7):
+        // Auto follows one carrying adapter, All / Named sum
+        // adapters — and a sum can double-count traffic that crosses
+        // two of them (VPN over PdaNet).
+        let totals_note = match snap.adapter_mode {
+            AdapterSelection::Auto => {
                 "Totals are for the carrying adapter (or all interfaces while it is idle) — \
-                 never the sum of all adapters, so VPN + PDAnet carrying the same bytes are \
-                 not counted twice.",
-            )
-            .small()
-            .color(Color32::GRAY),
-        );
+                 never the sum of all adapters, so VPN + PDaNet carrying the same bytes are \
+                 not counted twice."
+            }
+            AdapterSelection::All => {
+                "Totals are the sum of ALL adapters — traffic that crosses two adapters \
+                 (e.g. VPN over PdaNet) is counted twice."
+            }
+            AdapterSelection::Named(_) => {
+                "Totals are the sum of the ticked adapters — traffic that crosses two of \
+                 them (e.g. VPN over PdaNet) is counted twice."
+            }
+        };
+        ui.label(RichText::new(totals_note).small().color(Color32::GRAY));
     }
 
     fn draw_apps(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
@@ -508,23 +613,63 @@ impl MeterApp {
 
     fn draw_adapters(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
         ui.heading("Adapters (all — including virtual / VPN / PDAnet)");
+        // --- v0.7: which adapters feed the top numbers. ---
+        // Auto (default): the app picks the adapter carrying traffic
+        // and switches when it goes quiet. All: sum of everything.
+        // Ticking boxes switches to Named: the sum of just those
+        // adapters. Untick all to go back to Auto.
+        ui.horizontal(|ui| {
+            ui.label("Top numbers from:");
+            if ui
+                .selectable_label(
+                    snap.adapter_mode == AdapterSelection::Auto,
+                    "Auto (smart switch)",
+                )
+                .clicked()
+            {
+                self.set_adapter_mode(AdapterSelection::Auto);
+            }
+            if ui
+                .selectable_label(snap.adapter_mode == AdapterSelection::All, "All")
+                .clicked()
+            {
+                self.set_adapter_mode(AdapterSelection::All);
+            }
+            if let AdapterSelection::Named(names) = &snap.adapter_mode {
+                ui.label(format!("Selected: {}", names.join(", ")));
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Auto picks the adapter carrying traffic and switches when it goes quiet. \
+                 Tick boxes below to sum specific adapters instead — traffic that crosses \
+                 two adapters (e.g. VPN over PdaNet) is counted twice. Untick all to go \
+                 back to Auto.",
+            )
+            .small()
+            .color(Color32::GRAY),
+        );
+        ui.add_space(4.0);
         let spacing = ui.spacing().item_spacing.x;
         // Fixed numeric columns, same idea as the apps table; the
-        // name column takes the remaining width.
+        // name column takes the remaining width. The checkbox column
+        // is 24px at the left.
         let name_w = (ui.available_width()
+            - 24.0
             - 70.0
             - 56.0
             - 130.0
             - RATE_COL_W * 2.0
             - TOTAL_COL_W
             - 70.0
-            - spacing * 7.0)
+            - spacing * 8.0)
             .max(80.0);
-        let mut to_select: Option<u64> = None;
+        let mut to_click: Option<(String, bool)> = None;
         egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("adapters").striped(true).show(ui, |ui| {
+                    ui.add_sized(Vec2::new(24.0, 20.0), egui::Label::new(""));
                     ui.add_sized(
                         Vec2::new(name_w, 20.0),
                         egui::Label::new(RichText::new("Adapter").strong()),
@@ -556,7 +701,14 @@ impl MeterApp {
                     ui.add_sized(Vec2::new(70.0, 20.0), egui::Label::new(""));
                     ui.end_row();
                     for a in &snap.adapters {
-                        let name = if a.selected {
+                        let mut checked = a.checked;
+                        if ui
+                            .add_sized(Vec2::new(24.0, 18.0), egui::Checkbox::new(&mut checked, ""))
+                            .changed()
+                        {
+                            to_click = Some((a.name.clone(), checked));
+                        }
+                        let name = if a.selected && snap.adapter_mode == AdapterSelection::Auto {
                             RichText::new(format!("▶ {}", a.name)).strong()
                         } else {
                             RichText::new(&a.name)
@@ -580,19 +732,19 @@ impl MeterApp {
                             egui::Label::new(RichText::new(&a.total).monospace())
                                 .halign(egui::Align::RIGHT),
                         );
-                        if a.selected {
+                        if a.selected && snap.adapter_mode == AdapterSelection::Auto {
                             ui.label("selected");
-                        } else if ui.button("Select").clicked() {
-                            to_select = Some(a.luid);
+                        } else {
+                            ui.label("");
                         }
                         ui.end_row();
                     }
                 });
             });
-        if let Some(luid) = to_select {
-            if let Ok(mut req) = self.shared.select_request.lock() {
-                *req = Some(luid);
-            }
+        if let Some((name, now_checked)) = to_click {
+            let all_names: Vec<String> = snap.adapters.iter().map(|a| a.name.clone()).collect();
+            let mode = adapter_mode_after_click(&snap.adapter_mode, &all_names, &name, now_checked);
+            self.set_adapter_mode(mode);
         }
         ui.add_space(6.0);
         ui.heading("Diagnostics");
@@ -620,16 +772,49 @@ impl MeterApp {
 }
 
 impl eframe::App for MeterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // ~10 Hz repaint so the numbers and graph stay live.
         ctx.request_repaint_after(Duration::from_millis(100));
         let snap = self.snapshot();
 
+        // --- Minimal window size (v0.7) ---
+        // The window itself shrinks when Minimal is clicked: v0.6
+        // only hid panels and left the window big. The minimum size
+        // must drop first, or the 560x420 normal minimum would clamp
+        // the small window. Leaving Minimal restores the size the
+        // window had before (or the default full size).
+        if snap.minimal != self.minimal {
+            self.minimal = snap.minimal;
+            if snap.minimal {
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MINIMAL_MIN_SIZE.into()));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(MINIMAL_SIZE.into()));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(NORMAL_MIN_SIZE.into()));
+                let size = self.normal_size.unwrap_or_else(|| NORMAL_SIZE.into());
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
+        // Remember the full-view size so leaving Minimal restores it.
+        // Only real full-view sizes count — a window the user dragged
+        // small must not become the restore size.
+        if !snap.minimal {
+            if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
+                if size.x >= NORMAL_MIN_SIZE[0] && size.y >= NORMAL_MIN_SIZE[1] {
+                    self.normal_size = Some(size);
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Top bar: title, theme toggle, Minimal toggle,
-            // run-on-startup.
+            // Top bar: title, opacity slider (normal view), theme
+            // toggle, Minimal toggle, run-on-startup.
             ui.horizontal(|ui| {
-                ui.heading(format!("Internet Control — Usage Meter  v{VERSION}"));
+                if snap.minimal {
+                    ui.heading("Internet Control");
+                } else {
+                    ui.heading(format!("Internet Control — Usage Meter  v{VERSION}"));
+                    self.opacity_slider(ui, 90.0);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(theme_button_label(self.dark)).clicked() {
                         let dark = !self.dark;
@@ -641,10 +826,12 @@ impl eframe::App for MeterApp {
                             *req = Some(!snap.minimal);
                         }
                     }
-                    let mut startup = snap.run_on_startup;
-                    if ui.checkbox(&mut startup, "Run on startup").changed() {
-                        if let Ok(mut req) = self.shared.startup_request.lock() {
-                            *req = Some(startup);
+                    if !snap.minimal {
+                        let mut startup = snap.run_on_startup;
+                        if ui.checkbox(&mut startup, "Run on startup").changed() {
+                            if let Ok(mut req) = self.shared.startup_request.lock() {
+                                *req = Some(startup);
+                            }
                         }
                     }
                 });
@@ -661,17 +848,16 @@ impl eframe::App for MeterApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // The big numbers + IP are always on top, in both
-                    // views.
-                    self.draw_top_strip(ui, &snap);
-
                     if snap.minimal {
-                        // Minimal view: numbers + IP + the live graph.
-                        // No tabs, no app list, no adapters.
-                        ui.add_space(6.0);
-                        self.draw_graph(ui, &snap);
+                        // Minimal view (v0.7): rates + opacity slider
+                        // + IP. No session totals, no graph, no tabs.
+                        self.draw_minimal(ui, &snap);
                         return;
                     }
+
+                    // The big numbers + IP are always on top in the
+                    // full view.
+                    self.draw_top_strip(ui, &snap);
 
                     ui.add_space(6.0);
                     // Tabs.
@@ -695,6 +881,15 @@ impl eframe::App for MeterApp {
                     }
                 });
         });
+
+        // Apply the opacity if it changed (v0.7). The HWND comes
+        // from the frame; on Linux there is none and this is a no-op.
+        if self.applied_opacity != Some(self.opacity) {
+            if let Some(hwnd) = crate::opacity::hwnd_from_frame(frame) {
+                crate::opacity::apply_opacity(hwnd, self.opacity);
+            }
+            self.applied_opacity = Some(self.opacity);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -761,5 +956,42 @@ mod tests {
         let text = serde_json::to_string(&store).unwrap();
         let back: Store = serde_json::from_str(&text).unwrap();
         assert!(!back.config.dark_theme);
+    }
+
+    #[test]
+    fn opacity_round_trips_through_the_store() {
+        let mut store = Store::default();
+        assert_eq!(store.config.opacity, 1.0);
+        store.config.opacity = 0.65;
+        let text = serde_json::to_string(&store).unwrap();
+        let back: Store = serde_json::from_str(&text).unwrap();
+        assert!((back.config.opacity - 0.65).abs() < f32::EPSILON);
+        // Old configs without the field load as fully opaque.
+        let store: Store = serde_json::from_str(
+            r#"{"config":{},"today":{"date":"2026-11-26","down_bytes":0,"up_bytes":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.config.opacity, 1.0);
+    }
+
+    // Minimal really is small (v0.7): the window must shrink well
+    // below the normal minimum, and the drag minimum must be smaller
+    // still, or the window cannot reach the target size at all.
+    const _: () = assert!(MINIMAL_SIZE[0] < NORMAL_MIN_SIZE[0]);
+    const _: () = assert!(MINIMAL_SIZE[1] < NORMAL_MIN_SIZE[1]);
+    const _: () = assert!(MINIMAL_MIN_SIZE[0] < MINIMAL_SIZE[0]);
+    const _: () = assert!(MINIMAL_MIN_SIZE[1] < MINIMAL_SIZE[1]);
+    const _: () = assert!(MINIMAL_MIN_SIZE[0] >= 200.0);
+    const _: () = assert!(MINIMAL_MIN_SIZE[1] >= 100.0);
+    const _: () = assert!(NORMAL_SIZE[0] >= NORMAL_MIN_SIZE[0]);
+    const _: () = assert!(NORMAL_SIZE[1] >= NORMAL_MIN_SIZE[1]);
+
+    #[test]
+    fn minimal_window_target_size() {
+        // ~360x190: rates + slider + IP, nothing else.
+        assert_eq!(MINIMAL_SIZE, [360.0, 190.0]);
+        assert_eq!(MINIMAL_MIN_SIZE, [300.0, 150.0]);
+        assert_eq!(NORMAL_SIZE, [980.0, 720.0]);
+        assert_eq!(NORMAL_MIN_SIZE, [560.0, 420.0]);
     }
 }

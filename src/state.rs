@@ -105,11 +105,60 @@ pub struct TopTotals {
 }
 
 /// Input for the selected adapter, if one is selected.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TopInput {
     pub totals: IfTotals,
     pub down_bps: f64,
     pub up_bps: f64,
+}
+
+/// Sum totals + rates over the readings whose adapter name is in
+/// `names` (case-insensitive). `None` when nothing matches — every
+/// name is stale. Pure — unit-tested.
+pub fn sum_selected(readings: &[AdapterReading], names: &[String]) -> Option<TopInput> {
+    let mut acc: Option<TopInput> = None;
+    for r in readings {
+        if names.iter().any(|n| n.eq_ignore_ascii_case(&r.info.name)) {
+            let e = acc.get_or_insert_with(TopInput::default);
+            e.totals.down_bytes += r.info.in_octets;
+            e.totals.up_bytes += r.info.out_octets;
+            e.down_bps += r.down_bps;
+            e.up_bps += r.up_bps;
+        }
+    }
+    acc
+}
+
+/// Sum totals + rates over ALL readings. Pure — unit-tested.
+pub fn sum_all(readings: &[AdapterReading]) -> TopInput {
+    let mut acc = TopInput::default();
+    for r in readings {
+        acc.totals.down_bytes += r.info.in_octets;
+        acc.totals.up_bytes += r.info.out_octets;
+        acc.down_bps += r.down_bps;
+        acc.up_bps += r.up_bps;
+    }
+    acc
+}
+
+/// The busiest adapter by total bytes (in + out). First wins on ties,
+/// so the result is stable when two adapters carry the same bytes.
+/// Pure — unit-tested.
+pub fn pick_busiest<'a>(
+    readings: impl IntoIterator<Item = &'a AdapterReading>,
+) -> Option<&'a AdapterReading> {
+    let mut best: Option<&'a AdapterReading> = None;
+    for r in readings {
+        let total = r.info.in_octets + r.info.out_octets;
+        let better = match best {
+            None => true,
+            Some(b) => total > b.info.in_octets + b.info.out_octets,
+        };
+        if better {
+            best = Some(r);
+        }
+    }
+    best
 }
 
 /// Resolve the top numbers. Pure — unit-tested below.
@@ -304,6 +353,96 @@ pub enum AppView {
     Total,
 }
 
+/// Which adapters the top DOWNLOAD/UPLOAD numbers come from (v0.7).
+/// Stored in `config.json` by name (never by LUID — PdaNet gets a new
+/// LUID on every re-tether, so a saved LUID goes stale; the friendly
+/// name usually survives).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterSelection {
+    /// Smart switch (the v0.4–v0.6 behaviour, the default): one
+    /// adapter, with fallback to all interfaces when it goes dry and
+    /// auto-switch to the busiest carrying interface after ~1 s idle.
+    #[default]
+    Auto,
+    /// Sum of ALL adapters. Yes, two adapters can be used at once —
+    /// but traffic that crosses two of them (e.g. VPN over PdaNet)
+    /// is counted twice, so this is opt-in, not the default.
+    All,
+    /// Sum of just these adapter names. A name that no longer exists
+    /// (adapter unplugged / re-tethered under a new name) is simply
+    /// ignored; if none of them match, the top numbers fall back to
+    /// all interfaces with a note instead of reading 0.
+    Named(Vec<String>),
+}
+
+/// Toggle one adapter name in a Named set. Returns `None` when the
+/// set becomes empty — the caller switches back to Auto then.
+/// Pure — unit-tested.
+pub fn toggle_named(names: &[String], name: &str, now_checked: bool) -> Option<Vec<String>> {
+    let mut out: Vec<String> = names.to_vec();
+    if now_checked {
+        if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out.push(name.to_string());
+        }
+        Some(out)
+    } else {
+        out.retain(|n| !n.eq_ignore_ascii_case(name));
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+/// The adapter mode after the user clicks one adapter checkbox.
+/// Pure — unit-tested.
+///
+/// * `mode` — the current mode.
+/// * `all_names` — every adapter name in the list (needed when
+///   unchecking one box while in All mode: the result is "all but
+///   this one").
+/// * `name` — the clicked adapter. `now_checked` is its state AFTER
+///   the click.
+/// * Auto + any click starts a Named set with just that adapter.
+/// * All + uncheck switches to Named with every other adapter.
+/// * Named + toggle updates the set; empty set goes back to Auto.
+pub fn adapter_mode_after_click(
+    mode: &AdapterSelection,
+    all_names: &[String],
+    name: &str,
+    now_checked: bool,
+) -> AdapterSelection {
+    match mode {
+        AdapterSelection::Auto => AdapterSelection::Named(vec![name.to_string()]),
+        AdapterSelection::All => {
+            if now_checked {
+                // Cannot happen (all boxes are checked in All mode),
+                // but stay in All rather than surprising anyone.
+                AdapterSelection::All
+            } else {
+                // Unchecking one box in All mode means "all but this
+                // one"; unchecking the only adapter goes back to Auto.
+                let rest: Vec<String> = all_names
+                    .iter()
+                    .filter(|n| !n.eq_ignore_ascii_case(name))
+                    .cloned()
+                    .collect();
+                if rest.is_empty() {
+                    AdapterSelection::Auto
+                } else {
+                    AdapterSelection::Named(rest)
+                }
+            }
+        }
+        AdapterSelection::Named(names) => match toggle_named(names, name, now_checked) {
+            Some(names) => AdapterSelection::Named(names),
+            None => AdapterSelection::Auto,
+        },
+    }
+}
+
 /// Sort per-app rows in place. Rate/Total sort descending (busiest
 /// first); Name sorts ascending. Pure — unit-tested below.
 pub fn sort_apps(apps: &mut [AppReading], mode: SortMode) {
@@ -486,6 +625,11 @@ pub struct AdapterJson {
     pub total: String,
     pub unknown: bool,
     pub selected: bool,
+    /// Ticked in the Adapters tab (v0.7): in Auto mode always false
+    /// (the auto-selected adapter is shown with `selected` instead),
+    /// in All mode true for every row, in Named mode true for the
+    /// named adapters.
+    pub checked: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -549,6 +693,8 @@ pub struct StateJson {
     pub selected_luid: Option<u64>,
     pub selected_name: String,
     pub selected_ip: String,
+    /// Which adapters the top numbers come from (v0.7).
+    pub adapter_mode: AdapterSelection,
     pub minimal: bool,
     pub run_on_startup: bool,
     pub app_view: AppView,
@@ -577,8 +723,9 @@ pub struct Shared {
     /// `Arc` so the sampler can hold the same set.
     pub blocked: Arc<RwLock<HashSet<String>>>,
     pub store: Mutex<Store>,
-    /// Adapter selection requested from the UI (LUID).
-    pub select_request: Mutex<Option<u64>>,
+    /// Adapter mode requested from the UI (v0.7: Auto / All /
+    /// Named(names)). The bridge applies it on the next tick.
+    pub adapter_mode_request: Mutex<Option<AdapterSelection>>,
     pub minimal_request: Mutex<Option<bool>>,
     pub view_request: Mutex<Option<AppView>>,
     pub sort_request: Mutex<Option<SortMode>>,
@@ -600,6 +747,7 @@ impl Shared {
             version: VERSION.to_string(),
             minimal: store.config.minimal,
             app_view: store.config.app_view,
+            adapter_mode: store.config.adapter_selection.clone(),
             run_on_startup: store.config.run_on_startup,
             ..Default::default()
         };
@@ -607,7 +755,7 @@ impl Shared {
             snapshot: RwLock::new(snap),
             blocked: Arc::new(RwLock::new(blocked)),
             store: Mutex::new(store),
-            select_request: Mutex::new(None),
+            adapter_mode_request: Mutex::new(None),
             minimal_request: Mutex::new(None),
             view_request: Mutex::new(None),
             sort_request: Mutex::new(None),
@@ -626,6 +774,9 @@ impl Shared {
 pub struct Bridge {
     shared: std::sync::Arc<Shared>,
     selected_luid: Option<u64>,
+    /// Which adapters the top numbers come from (v0.7). Only used
+    /// for the top totals; the per-app list stays interface-agnostic.
+    adapter_mode: AdapterSelection,
     down_smoother: RateSmoother,
     up_smoother: RateSmoother,
     app_smoothers: HashMap<String, (RateSmoother, RateSmoother)>,
@@ -659,18 +810,20 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn new(shared: std::sync::Arc<Shared>) -> Self {
-        let (selected_luid, minimal, view) = {
+        let (selected_luid, minimal, view, adapter_mode) = {
             let store = shared.store.lock().unwrap_or_else(|e| e.into_inner());
             (
                 store.config.selected_luid,
                 store.config.minimal,
                 store.config.app_view,
+                store.config.adapter_selection.clone(),
             )
         };
         let _ = minimal;
         Self {
             shared,
             selected_luid,
+            adapter_mode,
             down_smoother: RateSmoother::new(),
             up_smoother: RateSmoother::new(),
             app_smoothers: HashMap::new(),
@@ -778,11 +931,7 @@ impl Bridge {
                 return;
             }
         }
-        if let Some(best) = batch
-            .adapters
-            .iter()
-            .filter(|a| a.info.oper_status == 1)
-            .max_by_key(|a| a.info.in_octets + a.info.out_octets)
+        if let Some(best) = pick_busiest(batch.adapters.iter().filter(|a| a.info.oper_status == 1))
         {
             self.select(best.info.luid, batch);
         }
@@ -798,16 +947,18 @@ impl Bridge {
             crate::log::log(&format!("capture status: {capture_label}"));
         }
         // --- UI requests -----------------------------------------------
-        if let Some(luid) = self
+        if let Some(mode) = self
             .shared
-            .select_request
+            .adapter_mode_request
             .lock()
             .ok()
             .and_then(|mut r| r.take())
         {
-            if batch.adapters.iter().any(|a| a.info.luid == luid) {
-                self.select(luid, &batch);
-            }
+            self.adapter_mode = mode.clone();
+            self.selection_note = None;
+            let mut store = self.shared.store.lock().unwrap_or_else(|e| e.into_inner());
+            store.config.adapter_selection = mode;
+            store.save();
         }
         if let Some(minimal) = self
             .shared
@@ -884,7 +1035,13 @@ impl Bridge {
                 }
             }
         }
-        if self.selected_luid.is_none() || self.selected_reading(&batch).is_none() {
+        // The single-adapter default only applies in Auto mode: in
+        // All / Named mode there is no "selected adapter" to pick,
+        // and re-picking here would re-baseline (and clear the graph)
+        // for no reason.
+        if self.adapter_mode == AdapterSelection::Auto
+            && (self.selected_luid.is_none() || self.selected_reading(&batch).is_none())
+        {
             self.pick_default(&batch);
         }
 
@@ -897,62 +1054,78 @@ impl Bridge {
             .update(total_all.down_bytes, total_all.up_bytes, elapsed);
         let all_rates = (fb.down_bps, fb.up_bps);
 
-        // Auto-reselect (v0.4 fix for the sticky-selection bug): the
-        // selected adapter has been idle for ~1 s while other
-        // interfaces carry traffic — switch to the busiest carrying
-        // interface instead of showing the fallback forever. This
-        // runs BEFORE the top numbers are resolved, so the tick after
-        // a switch already shows the new adapter.
-        let mut sel = self.selected_reading(&batch).map(|s| TopInput {
-            totals: IfTotals {
-                down_bytes: s.info.in_octets,
-                up_bytes: s.info.out_octets,
-            },
-            down_bps: s.down_bps,
-            up_bps: s.up_bps,
-        });
-        let sel_idle = sel
-            .map(|s| s.totals.down_bytes + s.totals.up_bytes == 0)
-            .unwrap_or(true);
-        let traffic_flows = total_all.down_bytes + total_all.up_bytes > 0;
-        if capture_active && sel_idle && traffic_flows {
-            self.idle_ticks += 1;
-        } else {
-            self.idle_ticks = 0;
-        }
-        if self.idle_ticks >= IDLE_RESELECT_TICKS {
-            self.idle_ticks = 0;
-            if let Some(best) = batch
-                .adapters
-                .iter()
-                .filter(|a| a.info.in_octets + a.info.out_octets > 0)
-                .max_by_key(|a| a.info.in_octets + a.info.out_octets)
-            {
-                let name = best.info.name.clone();
-                let luid = best.info.luid;
-                self.select(luid, &batch);
-                self.selection_note = Some(format!(
-                    "Auto-switched to {name} — the previous adapter showed no traffic."
-                ));
-                sel = self.selected_reading(&batch).map(|s| TopInput {
-                    totals: IfTotals {
-                        down_bytes: s.info.in_octets,
-                        up_bytes: s.info.out_octets,
-                    },
-                    down_bps: s.down_bps,
-                    up_bps: s.up_bps,
-                });
+        // The top-numbers input depends on the adapter mode (v0.7).
+        // Auto: the single selected adapter (as before). All: the sum
+        // over every adapter. Named: the sum over just the named
+        // adapters — or a zero input when none of them match, so
+        // resolve_top falls back to all interfaces with a note
+        // instead of showing 0.
+        let mut sel: Option<TopInput> = match &self.adapter_mode {
+            AdapterSelection::Auto => self.selected_reading(&batch).map(|s| TopInput {
+                totals: IfTotals {
+                    down_bytes: s.info.in_octets,
+                    up_bytes: s.info.out_octets,
+                },
+                down_bps: s.down_bps,
+                up_bps: s.up_bps,
+            }),
+            AdapterSelection::All => Some(sum_all(&batch.adapters)),
+            AdapterSelection::Named(names) => {
+                Some(sum_selected(&batch.adapters, names).unwrap_or_default())
+            }
+        };
+
+        // Auto-reselect (v0.4 fix for the sticky-selection bug) only
+        // applies in Auto mode: the selected adapter has been idle
+        // for ~1 s while other interfaces carry traffic — switch to
+        // the busiest carrying interface instead of showing the
+        // fallback forever. This runs BEFORE the top numbers are
+        // resolved, so the tick after a switch already shows the new
+        // adapter.
+        if self.adapter_mode == AdapterSelection::Auto {
+            let sel_idle = sel
+                .map(|s| s.totals.down_bytes + s.totals.up_bytes == 0)
+                .unwrap_or(true);
+            let traffic_flows = total_all.down_bytes + total_all.up_bytes > 0;
+            if capture_active && sel_idle && traffic_flows {
+                self.idle_ticks += 1;
+            } else {
+                self.idle_ticks = 0;
+            }
+            if self.idle_ticks >= IDLE_RESELECT_TICKS {
+                self.idle_ticks = 0;
+                if let Some(best) = pick_busiest(
+                    batch
+                        .adapters
+                        .iter()
+                        .filter(|a| a.info.in_octets + a.info.out_octets > 0),
+                ) {
+                    let name = best.info.name.clone();
+                    let luid = best.info.luid;
+                    self.select(luid, &batch);
+                    self.selection_note = Some(format!(
+                        "Auto-switched to {name} — the previous adapter showed no traffic."
+                    ));
+                    sel = self.selected_reading(&batch).map(|s| TopInput {
+                        totals: IfTotals {
+                            down_bytes: s.info.in_octets,
+                            up_bytes: s.info.out_octets,
+                        },
+                        down_bps: s.down_bps,
+                        up_bps: s.up_bps,
+                    });
+                }
             }
         }
 
-        let sel_name = self.selected_reading(&batch).map(|s| s.info.name.clone());
-        let top = resolve_top(
-            sel,
-            sel_name.as_deref(),
-            total_all,
-            all_rates,
-            capture_active,
-        );
+        // Name used in the fallback note when the input is dry while
+        // traffic flows elsewhere.
+        let sel_label: Option<&str> = match &self.adapter_mode {
+            AdapterSelection::Auto => self.selected_reading(&batch).map(|s| s.info.name.as_str()),
+            AdapterSelection::All => Some("All adapters"),
+            AdapterSelection::Named(_) => Some("Selected adapters"),
+        };
+        let top = resolve_top(sel, sel_label, total_all, all_rates, capture_active);
 
         // --- session / today / peak from the RESOLVED top totals ------
         let now_totals = IfTotals {
@@ -1074,6 +1247,17 @@ impl Bridge {
                 total: format_bytes(a.info.in_octets + a.info.out_octets),
                 unknown: a.info.name.starts_with("Unknown interface"),
                 selected: Some(a.info.luid) == self.selected_luid,
+                // Checkbox state (v0.7): in Auto mode nothing is
+                // ticked — the auto-selected adapter is shown with
+                // `selected` instead. In All mode everything is
+                // ticked; in Named mode the named adapters are.
+                checked: match &self.adapter_mode {
+                    AdapterSelection::Auto => false,
+                    AdapterSelection::All => true,
+                    AdapterSelection::Named(names) => {
+                        names.iter().any(|n| n.eq_ignore_ascii_case(&a.info.name))
+                    }
+                },
             })
             .collect();
         let apps_json: Vec<AppJson> = app_rows
@@ -1096,6 +1280,56 @@ impl Bridge {
                 }
             })
             .collect();
+        // What the top strip shows as the source (v0.7). Auto: the
+        // single selected adapter. All: "All adapters" with the IP
+        // of the busiest one. Named: the requested names joined, with
+        // the IP of the busiest one that matched ("—" when none did).
+        let (selected_name, selected_ip) = match &self.adapter_mode {
+            AdapterSelection::Auto => (
+                sel_reading
+                    .map(|s| s.info.name.clone())
+                    .unwrap_or_else(|| "— (waiting for adapters…)".to_string()),
+                sel_reading
+                    .and_then(|s| s.info.ipv4.clone())
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+            AdapterSelection::All => (
+                "All adapters".to_string(),
+                pick_busiest(batch.adapters.iter())
+                    .and_then(|b| b.info.ipv4.clone())
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+            AdapterSelection::Named(names) => {
+                let matched: Vec<&AdapterReading> = batch
+                    .adapters
+                    .iter()
+                    .filter(|a| names.iter().any(|n| n.eq_ignore_ascii_case(&a.info.name)))
+                    .collect();
+                (
+                    if names.is_empty() {
+                        "Selected adapters".to_string()
+                    } else {
+                        names.join(" + ")
+                    },
+                    pick_busiest(matched)
+                        .and_then(|b| b.info.ipv4.clone())
+                        .unwrap_or_else(|| "—".to_string()),
+                )
+            }
+        };
+        // The source label for the Overview / Diagnostics: in All /
+        // Named mode the top numbers are a sum, not "the selected
+        // adapter" — say so. The fallback label wins when the
+        // fallback is active (the note explains it).
+        let top_source_label = if top.source == TopSource::AllInterfacesFallback {
+            top.source.label().to_string()
+        } else {
+            match &self.adapter_mode {
+                AdapterSelection::Auto => top.source.label().to_string(),
+                AdapterSelection::All => "all adapters".to_string(),
+                AdapterSelection::Named(_) => "selected adapters".to_string(),
+            }
+        };
         let snap = StateJson {
             version: VERSION.to_string(),
             capture_label: batch.capture_status.label(),
@@ -1108,7 +1342,7 @@ impl Bridge {
                 up_total: top.up_total,
                 down: format_rate(down_bps),
                 up: format_rate(up_bps),
-                source: top.source.label().to_string(),
+                source: top_source_label.clone(),
                 note: top.note.clone().or_else(|| self.selection_note.clone()),
             },
             session: TotalsJson {
@@ -1136,17 +1370,14 @@ impl Bridge {
                     CaptureStatus::Active { packets, .. } => packets,
                     _ => 0,
                 },
-                top_source: top.source.label().to_string(),
+                top_source: top_source_label,
                 fallback_active: top.source == TopSource::AllInterfacesFallback,
                 capture_label: batch.capture_status.label(),
             },
             selected_luid: self.selected_luid,
-            selected_name: sel_reading
-                .map(|s| s.info.name.clone())
-                .unwrap_or_else(|| "— (waiting for adapters…)".to_string()),
-            selected_ip: sel_reading
-                .and_then(|s| s.info.ipv4.clone())
-                .unwrap_or_else(|| "—".to_string()),
+            selected_name,
+            selected_ip,
+            adapter_mode: self.adapter_mode.clone(),
             minimal,
             run_on_startup,
             app_view: self.app_list.view(),
@@ -1539,5 +1770,203 @@ mod tests {
         assert_eq!(block_state(true, 0.0, 0.0), BlockState::Blocked);
         // Unblocked again: never "blocked" in any form.
         assert_eq!(block_state(false, 0.0, 0.0), BlockState::NotBlocked);
+    }
+
+    // --- v0.7: multi-adapter sums + busiest pick ------------------------
+
+    fn reading(
+        name: &str,
+        in_octets: u64,
+        out_octets: u64,
+        down_bps: f64,
+        up_bps: f64,
+    ) -> AdapterReading {
+        AdapterReading {
+            info: AdapterInfo {
+                luid: 100 + name.len() as u64,
+                index: name.len() as u32,
+                name: name.to_string(),
+                in_octets,
+                out_octets,
+                ..Default::default()
+            },
+            down_bps,
+            up_bps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sum_selected_adds_only_the_named_adapters() {
+        let readings = vec![
+            reading(
+                "PdaNet Broadband Connection",
+                1_000_000,
+                200_000,
+                9_000_000.0,
+                1_800_000.0,
+            ),
+            reading("Wi-Fi", 500_000, 100_000, 4_000_000.0, 900_000.0),
+            reading("Ethernet", 0, 0, 0.0, 0.0),
+        ];
+        let sum = sum_selected(
+            &readings,
+            &[
+                "pdanet broadband connection".to_string(),
+                "Wi-Fi".to_string(),
+            ],
+        )
+        .unwrap();
+        // Names match case-insensitively.
+        assert_eq!(sum.totals.down_bytes, 1_500_000);
+        assert_eq!(sum.totals.up_bytes, 300_000);
+        assert!((sum.down_bps - 13_000_000.0).abs() < 1.0);
+        assert!((sum.up_bps - 2_700_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn sum_selected_ignores_stale_names_and_reports_none_when_empty() {
+        let readings = vec![reading("Wi-Fi", 500_000, 100_000, 4_000_000.0, 900_000.0)];
+        // One stale name + one live one: the live one still counts.
+        let sum = sum_selected(
+            &readings,
+            &[
+                "PdaNet Broadband Connection".to_string(),
+                "Wi-Fi".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sum.totals.down_bytes, 500_000);
+        // No name matches at all (PdaNet re-tethered under a new
+        // name, or the adapter is gone): None, so the bridge falls
+        // back to all interfaces instead of showing 0.
+        assert!(sum_selected(&readings, &["PdaNet Broadband Connection".to_string()]).is_none());
+        assert!(sum_selected(&readings, &[]).is_none());
+        assert!(sum_selected(&[], &["Wi-Fi".to_string()]).is_none());
+    }
+
+    #[test]
+    fn sum_all_adds_everything() {
+        let readings = vec![
+            reading(
+                "PdaNet Broadband Connection",
+                1_000_000,
+                200_000,
+                9_000_000.0,
+                1_800_000.0,
+            ),
+            reading("Wi-Fi", 500_000, 100_000, 4_000_000.0, 900_000.0),
+        ];
+        let sum = sum_all(&readings);
+        assert_eq!(sum.totals.down_bytes, 1_500_000);
+        assert_eq!(sum.totals.up_bytes, 300_000);
+        assert!((sum.down_bps - 13_000_000.0).abs() < 1.0);
+        // Empty list: zero, not a crash.
+        let sum = sum_all(&[]);
+        assert_eq!(sum.totals.down_bytes, 0);
+        assert_eq!(sum.down_bps, 0.0);
+    }
+
+    #[test]
+    fn pick_busiest_is_by_total_bytes_first_wins_on_ties() {
+        let readings = vec![
+            reading("slow", 100, 0, 1_000.0, 0.0),
+            reading("fast-a", 1_000_000, 500_000, 9_000_000.0, 1_000_000.0),
+            reading("fast-b", 1_000_000, 500_000, 9_000_000.0, 1_000_000.0),
+        ];
+        assert_eq!(pick_busiest(&readings).unwrap().info.name, "fast-a");
+        // A filter composes: busiest among the carrying ones only.
+        let carrying = pick_busiest(
+            readings
+                .iter()
+                .filter(|a| a.info.in_octets + a.info.out_octets > 0),
+        )
+        .unwrap();
+        assert_eq!(carrying.info.name, "fast-a");
+        assert!(pick_busiest(&[] as &[AdapterReading]).is_none());
+        assert!(pick_busiest(readings.iter().filter(|_| false)).is_none());
+    }
+
+    #[test]
+    fn toggle_named_adds_dedupes_and_removes() {
+        let names = vec!["Wi-Fi".to_string()];
+        // Add, case-insensitively deduped.
+        let out = toggle_named(&names, "PdaNet", true).unwrap();
+        assert_eq!(out, vec!["Wi-Fi", "PdaNet"]);
+        let out = toggle_named(&out, "wi-fi", true).unwrap();
+        assert_eq!(out, vec!["Wi-Fi", "PdaNet"]);
+        // Remove (case-insensitive); last one out -> None (Auto).
+        let out = toggle_named(&out, "WI-FI", false).unwrap();
+        assert_eq!(out, vec!["PdaNet"]);
+        assert!(toggle_named(&out, "pdanet", false).is_none());
+    }
+
+    #[test]
+    fn adapter_mode_after_click_covers_every_transition() {
+        let all = vec![
+            "PdaNet Broadband Connection".to_string(),
+            "Wi-Fi".to_string(),
+            "Ethernet".to_string(),
+        ];
+        // Auto + tick one box: Named with just that adapter.
+        assert_eq!(
+            adapter_mode_after_click(&AdapterSelection::Auto, &all, "Wi-Fi", true),
+            AdapterSelection::Named(vec!["Wi-Fi".to_string()])
+        );
+        // Named + tick another: it joins the set.
+        let mode = AdapterSelection::Named(vec!["Wi-Fi".to_string()]);
+        assert_eq!(
+            adapter_mode_after_click(&mode, &all, "PdaNet Broadband Connection", true),
+            AdapterSelection::Named(vec![
+                "Wi-Fi".to_string(),
+                "PdaNet Broadband Connection".to_string()
+            ])
+        );
+        // Named + untick the last one: back to Auto.
+        assert_eq!(
+            adapter_mode_after_click(&mode, &all, "Wi-Fi", false),
+            AdapterSelection::Auto
+        );
+        // All + untick one: Named with every other adapter.
+        assert_eq!(
+            adapter_mode_after_click(&AdapterSelection::All, &all, "Wi-Fi", false),
+            AdapterSelection::Named(vec![
+                "PdaNet Broadband Connection".to_string(),
+                "Ethernet".to_string()
+            ])
+        );
+        // All with a single adapter + untick it: back to Auto.
+        let one = vec!["Wi-Fi".to_string()];
+        assert_eq!(
+            adapter_mode_after_click(&AdapterSelection::All, &one, "Wi-Fi", false),
+            AdapterSelection::Auto
+        );
+    }
+
+    #[test]
+    fn adapter_selection_defaults_to_auto_and_round_trips() {
+        assert_eq!(AdapterSelection::default(), AdapterSelection::Auto);
+        for mode in [
+            AdapterSelection::Auto,
+            AdapterSelection::All,
+            AdapterSelection::Named(vec!["Wi-Fi".to_string(), "PdaNet".to_string()]),
+        ] {
+            let text = serde_json::to_string(&mode).unwrap();
+            let back: AdapterSelection = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, mode);
+        }
+        // An old config.json without the field loads as Auto, and a
+        // saved single selection still feeds Auto mode.
+        let store: crate::store::Store = serde_json::from_str(
+            r#"{"config":{"selected_name":"PdaNet Broadband Connection"},"today":{"date":"2026-11-26","down_bytes":0,"up_bytes":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.config.adapter_selection, AdapterSelection::Auto);
+        assert_eq!(
+            store.config.selected_name.as_deref(),
+            Some("PdaNet Broadband Connection")
+        );
+        // ...and opacity defaults to fully opaque on old configs.
+        assert_eq!(store.config.opacity, 1.0);
     }
 }

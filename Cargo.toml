@@ -1,8 +1,8 @@
 [package]
 name = "internet-control"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.6.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, Minimal view with the live graph, dark/light theme."
+description = "Internet Control — precise Windows internet usage meter (v0.7.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, really-small Minimal view with opacity slider, dark/light theme, multi-adapter selection."
 license = "MIT"
 
 [dependencies]
@@ -13,6 +13,9 @@ serde_json = "1"
 # IP/TCP/UDP header parsing for per-app flow attribution (pure Rust,
 # also used by the unit tests on Linux).
 etherparse = "0.13"
+# Getting the window handle for the opacity slider (v0.7): eframe's
+# Frame implements HasWindowHandle from this crate.
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -25,6 +28,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # Layered-window opacity (v0.7): Get/SetWindowLongPtrW,
+    # SetLayeredWindowAttributes, WS_EX_LAYERED.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # WinDivert 2.2 driver wrapper (stable 0.6.0; 0.7.x is beta). Needs the
 # WinDivert 2.2.2 driver files at build time via WINDIVERT_PATH, and

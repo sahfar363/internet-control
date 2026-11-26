@@ -1456,11 +1456,12 @@ dependencies = [
 
 [[package]]
 name = "internet-control"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "eframe",
  "egui",
  "etherparse",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "windivert",

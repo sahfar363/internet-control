@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.6.0)
+# Internet Control — Usage Meter (v0.7.0)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a native
 egui UI (complete Rust, no WebView2/Edge) that shows **real, precise
@@ -9,6 +9,40 @@ with block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.7.0 changes (really-small Minimal, opacity slider, multi-adapter)
+
+Sahand tested v0.6.0: it works, but Minimal did not really make
+the window small — it only hid panels. v0.7.0 fixes that and adds
+two more things he asked for:
+
+- **Really-small Minimal** — clicking Minimal now shrinks the
+  window itself to ~360x190: just the big download/upload rates,
+  the opacity slider, and the IP underneath. No session totals, no
+  graph, no tabs. Clicking **Full view** restores the window to
+  the size it had before. The Minimal window is still resizable
+  (down to 300x150).
+- **Opacity slider** — a slider (20%–100%, saved in `config.json`)
+  in the top bar in normal view and under the rates in Minimal
+  view, that makes the whole window more or less transparent.
+  On Windows it uses a layered window (`WS_EX_LAYERED` +
+  `SetLayeredWindowAttributes`); at 100% the layered style is
+  removed again so the window behaves exactly like a normal one.
+- **Multi-adapter selection on the Adapters tab** — the top
+  numbers no longer have to follow one adapter. Each adapter row
+  has a checkbox, plus **Auto (smart switch)** (the default — the
+  v0.4–v0.6 behaviour: one adapter, fallback to all interfaces
+  when it goes dry, auto-switch to the busiest carrying interface)
+  and **All** (sum of everything). Ticking boxes sums just those
+  adapters; unticking all goes back to Auto. The selection is
+  saved by adapter *name*, not LUID, so it survives PdaNet
+  re-tethers. Yes, two adapters can be used at once — but traffic
+  that crosses two of them (e.g. VPN over PdaNet) is counted
+  twice, so the UI warns about it and Auto stays the default. The
+  per-app list is unchanged (it is interface-agnostic), and the
+  top numbers still never read 0 while traffic flows: a Named
+  selection whose adapters are all dry falls back to all
+  interfaces with a note.
 
 ## What v0.6.0 changes (back to native egui — no WebView2/Edge)
 
@@ -49,8 +83,10 @@ carries over from the WebView UI:
   is cut off when the window is short; the tables scroll
   horizontally when the window is narrow.
 - **Resizable Minimal window** — the window is resizable in both
-  views (minimum 560×420). Minimal still shows only the big
-  numbers, the session totals, the IP and the live graph.
+  views (minimum 560×420 in normal view). Minimal shows only the
+  big numbers, the IP and the live graph. (v0.7.0: Minimal now
+  shrinks the window itself to ~360x190 with just rates, the
+  opacity slider and the IP — no graph, no session totals.)
 - **IP in both views** — the carrying adapter's IP is shown under
   the big numbers in normal and in Minimal view.
 - The termination note ("Terminated 3 open TCP connections for
@@ -323,7 +359,9 @@ was even shown. v0.4.1:
   toggle chooses which the list is primarily sorted/shown by.
 - **Minimal toggle** — same app, shows ONLY the big download/upload
   numbers, the session totals, the IP, and the live 60-second
-  download/upload graph (since v0.5.2).
+  download/upload graph (since v0.5.2). Since v0.7.0 Minimal shrinks
+  the window itself to ~360x190 and shows only the rates, the
+  opacity slider and the IP — no session totals, no graph.
 
 Everything else is unchanged from v0.3: per-app attribution via the
 WinDivert FLOW layer plus the v0.5 table-based fallback map, ~1 s
@@ -381,16 +419,19 @@ meter shows 0. Counting the actual packets is the only way.
   never a huge spike.
 - **Totals are for the selected adapter only** (or the all-interfaces
   fallback, clearly labelled, when the selected adapter is dry),
-  never a silent sum of all adapters. By default the adapter on the
-  default IPv4 route (0.0.0.0/0, lowest metric) is selected; you can
-  pick another one on the Adapters tab. Your selection is saved.
+  never a silent sum of all adapters — unless you choose it: since
+  v0.7.0 the Adapters tab offers **Auto** (default, one adapter with
+  smart switching), **All**, or ticked adapters summed. By default
+  the adapter on the default IPv4 route (0.0.0.0/0, lowest metric)
+  is selected; you can pick another one on the Adapters tab. Your
+  selection is saved.
 - Session totals, today totals (reset at local midnight, saved to
   `%APPDATA%\internet-control\config.json`), peak rates, and a
   60-second live graph.
 
 ## Install
 
-1. Download `internet-control-v0.6.0-windows-x64.zip` from Releases.
+1. Download `internet-control-v0.7.0-windows-x64.zip` from Releases.
 2. Unzip it anywhere. **Keep all files together in the same folder**
    — the exe will not work properly on its own: `internet-control.exe`,
    `WinDivert.dll`, `WinDivert64.sys` (the WinDivert 2.2.2 driver
@@ -415,11 +456,15 @@ a browser).
   the reason (bad on PDAnet). If the top numbers say "showing all
   interfaces instead", the selected adapter is dry — check the
   Diagnostics section to see which interface is actually carrying
-  traffic, then Select it on the Adapters tab.
+  traffic. On the Adapters tab, **Auto (smart switch)** is the
+  default: the app follows the carrying adapter by itself. Tick
+  the boxes next to adapters to sum just those instead, or pick
+  **All** to sum everything (traffic crossing two adapters, e.g.
+  VPN over PdaNet, is counted twice).
 - If the auto-picked adapter is wrong (e.g. it picked WiFi while you
-  are tethered), click **Select** next to the right adapter on the
-  Adapters tab — PDAnet is usually the one whose traffic moves when
-  you download something.
+  are tethered), tick the right adapter's box on the Adapters tab —
+  PDAnet is usually the one whose traffic moves when you download
+  something.
 - On the Apps tab, click **Block** next to an app to cut its
   internet at once — its open TCP connections are terminated
   immediately and its pre-existing flows are dropped, so the row
@@ -429,8 +474,13 @@ a browser).
   you close Internet Control.
 - Click a column header to sort the Apps list, or the **Rate /
   Total** toggle to switch views. The list never re-sorts by itself.
-- Click **Minimal** for the small view (usage + speed + IP + the live graph).
-  The Minimal window is resizable too — drag its edges like the normal one.
+- Click **Minimal** for the really small view: the window shrinks
+  to ~360x190 with just the rates, the opacity slider and the IP.
+  The Minimal window is resizable too — drag its edges like the
+  normal one (down to 300x150). Click **Full view** to go back.
+- Drag the **Opacity** slider at the top (or under the rates in
+  Minimal view) to make the window see-through — 20% is the most
+  transparent it goes, 100% is fully solid. The setting is saved.
 - Click **Theme: Dark** / **Theme: Light** at the top to switch between
   the dark and light theme. The choice is saved.
 - If the window is short, scroll down — the whole panel scrolls, so

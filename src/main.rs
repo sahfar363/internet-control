@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.6.0.
+//! Internet Control — usage meter v0.7.0.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -18,8 +18,12 @@
 //! works fine. The old egui window (v0.3.0) always opened fine, so
 //! the UI is native egui again — same WinDivert engine, same
 //! blocking (including terminating existing connections, v0.5),
-//! Minimal view with the live graph (v0.5.2), dark/light theme
-//! toggle, scrolling everywhere and a resizable Minimal window.
+//! dark/light theme toggle, scrolling everywhere and a resizable
+//! Minimal window. v0.7 makes Minimal REALLY small (the window
+//! itself shrinks to ~360x190 with just rates + opacity slider +
+//! IP), adds the opacity slider (layered window, Windows only),
+//! and lets the top numbers sum several adapters at once (Auto /
+//! All / ticked adapters on the Adapters tab).
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
@@ -29,6 +33,7 @@ mod capture;
 mod connections;
 mod log;
 mod meter;
+mod opacity;
 mod startup;
 mod state;
 mod store;

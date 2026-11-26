@@ -41,10 +41,26 @@ pub struct Config {
     /// dark for saved configs written before v0.6 (no field present).
     #[serde(default = "default_true")]
     pub dark_theme: bool,
+    /// Window opacity 0.2..=1.0 (v0.7). 1.0 = fully opaque.
+    /// Defaults to opaque for saved configs written before v0.7.
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    /// Which adapters the top numbers come from (v0.7): Auto = smart
+    /// switch to the busiest carrying interface (the v0.4–v0.6
+    /// behaviour, the default), All = sum of all adapters,
+    /// Named(names) = sum of just these adapter names. The old
+    /// single-selection fields below are kept: Auto mode still uses
+    /// them, and they survive a round-trip back to Auto.
+    #[serde(default)]
+    pub adapter_selection: crate::state::AdapterSelection,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_opacity() -> f32 {
+    crate::opacity::OPACITY_DEFAULT
 }
 
 impl Default for Config {
@@ -57,6 +73,8 @@ impl Default for Config {
             minimal: false,
             app_view: crate::state::AppView::default(),
             dark_theme: true,
+            opacity: crate::opacity::OPACITY_DEFAULT,
+            adapter_selection: crate::state::AdapterSelection::default(),
         }
     }
 }
