@@ -57,6 +57,29 @@
 //! WebView2 Runtime). Only our own explicit folder is ever touched,
 //! never any shared Edge folder; the webview only ever shows our
 //! own local page, so its user data is disposable.
+//!
+//! v0.5.4: the v0.5.3 retry itself was broken, and the banner proved
+//! it — "WebView2 controller creation failed: TaskCanceled
+//! [WebView2 runtime 158.0.4370.33]". The runtime is present and
+//! current, so Edge is fine. `TaskCanceled` comes from
+//! `wait_with_pump` (see the `webview2-com` crate): it returns it
+//! when `GetMessage` retrieves WM_QUIT. The only WM_QUIT source is
+//! our own `window_proc`: attempt 1's window is destroyed on a
+//! retryable failure (`Fallback` -> `destroy_window`), WM_DESTROY
+//! posts WM_QUIT, and nobody pumps messages between the destroy and
+//! the retry — so the stale quit message is still queued when
+//! attempt 2 starts pumping in `wait_for_async_operation`, and the
+//! wait dies at once. (Checked, not assumed: each attempt creates a
+//! FRESH window in `WebView::create` — the retry never reuses a
+//! destroyed HWND; the poison is the queued WM_QUIT, which also
+//! explains why the window flashes open for a split second and
+//! then closes: that is attempt 1 being shown and destroyed.)
+//! The fix drains stale WM_QUIT messages before every attempt
+//! (`drain_quit_messages`, `PeekMessageW` with a WM_QUIT filter),
+//! pauses ~500 ms before the retry so a crashed Edge process can
+//! exit and release its locks, and records every attempt in the
+//! log and in the banner reason, so the next banner shows what
+//! happened on each try.
 
 /// Plain-data outcome of the first navigation attempt (v0.5.2).
 ///
@@ -206,6 +229,28 @@ fn failure_with_runtime_info(reason: &str, runtime_version: Option<&str>) -> Str
     }
 }
 
+/// Combine every attempt's failure into the final banner reason
+/// (v0.5.4), so the next banner shows what happened on each try.
+/// One attempt: its error unchanged. Several: the last error
+/// first, then the earlier attempts numbered in parentheses.
+/// Pure: no COM, no I/O.
+#[cfg(any(windows, test))]
+fn format_attempt_history(attempts: &[String]) -> String {
+    match attempts.len() {
+        0 => "WebView2 window failed".to_string(),
+        1 => attempts[0].clone(),
+        _ => {
+            let last = attempts.last().expect("non-empty");
+            let earlier: Vec<String> = attempts[..attempts.len() - 1]
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("attempt {}: {e}", i + 1))
+                .collect();
+            format!("{last} (earlier attempts: {})", earlier.join("; "))
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::mem;
@@ -260,6 +305,38 @@ mod imp {
         }
     }
 
+    /// Drain any stale WM_QUIT left in this thread's message queue.
+    ///
+    /// v0.5.4: a previous attempt's window is destroyed on a
+    /// retryable failure (Fallback -> `destroy_window`), and our
+    /// `window_proc` posts WM_QUIT from WM_DESTROY. Nobody pumps
+    /// messages between the destroy and the retry, so the quit
+    /// message is still queued when the next attempt starts pumping
+    /// in `wait_for_async_operation` — `GetMessage` returns 0 and
+    /// the wait dies with TaskCanceled, even though the runtime is
+    /// fine. Draining before every attempt makes each attempt start
+    /// with a clean queue. Only WM_QUIT is removed; no other
+    /// message is touched. Safe to call when the queue is already
+    /// clean (a no-op then, e.g. on the first attempt).
+    fn drain_quit_messages() {
+        unsafe {
+            let mut msg = MSG::default();
+            while WindowsAndMessaging::PeekMessageW(
+                &mut msg,
+                None,
+                WindowsAndMessaging::WM_QUIT,
+                WindowsAndMessaging::WM_QUIT,
+                WindowsAndMessaging::PM_REMOVE,
+            )
+            .as_bool()
+            {
+                // Discard: this quit belongs to a window we already
+                // destroyed on purpose between attempts, not to the
+                // user closing the app.
+            }
+        }
+    }
+
     /// One window attempt: create the window + control on
     /// `user_data_folder` and run the first navigation. The caller
     /// (`run`, below) decides whether a failure is worth one retry
@@ -268,6 +345,10 @@ mod imp {
         url: &str,
         user_data_folder: &std::path::Path,
     ) -> std::result::Result<(), String> {
+        // v0.5.4: drain the stale WM_QUIT a previous attempt's
+        // destroyed window left behind, or this attempt's first
+        // `wait_for_async_operation` dies with TaskCanceled at once.
+        drain_quit_messages();
         let view = WebView::create(url, user_data_folder)?;
         view.run()
     }
@@ -765,6 +846,13 @@ mod imp {
 /// final failure reason carries the runtime version, so the v0.5.1
 /// banner shows it (and says explicitly when no runtime is
 /// installed at all).
+///
+/// v0.5.4: the v0.5.3 retry died at once with TaskCanceled — the
+/// stale WM_QUIT from attempt 1's destroyed window (see
+/// `imp::drain_quit_messages`, called at the start of every
+/// attempt). Each attempt is logged, the retry pauses ~500 ms so
+/// a crashed Edge process can exit and release its locks, and the
+/// final reason lists what happened on every attempt.
 #[cfg(windows)]
 pub fn run(url: &str) -> Result<(), String> {
     let folder = imp::webview2_user_data_dir();
@@ -777,10 +865,18 @@ pub fn run(url: &str) -> Result<(), String> {
 
     let mut dir = folder;
     let mut retried = false;
+    let mut attempts: Vec<String> = Vec::new();
     loop {
+        let attempt_no = attempts.len() + 1;
+        crate::log::log(&format!(
+            "WebView2 window attempt {attempt_no} (user data folder: {})",
+            dir.display()
+        ));
         match imp::run_once(url, &dir) {
             Ok(()) => return Ok(()),
             Err(e) => {
+                crate::log::log(&format!("WebView2 window attempt {attempt_no} failed: {e}"));
+                attempts.push(e.clone());
                 if should_retry_window(&e, retried) {
                     retried = true;
                     let ts = now_secs();
@@ -797,9 +893,17 @@ pub fn run(url: &str) -> Result<(), String> {
                         );
                     }
                     dir = retry_dir_for(&dir, ts, renamed);
+                    // v0.5.4: give a crashed Edge process a moment
+                    // to exit and release its locks before the
+                    // retry creates a new environment.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                     continue;
                 }
-                return Err(failure_with_runtime_info(&e, runtime_version.as_deref()));
+                let with_history = format_attempt_history(&attempts);
+                return Err(failure_with_runtime_info(
+                    &with_history,
+                    runtime_version.as_deref(),
+                ));
             }
         }
     }
@@ -972,5 +1076,74 @@ mod tests {
         assert!(without.starts_with(reason), "{without}");
         assert!(without.contains("not found"), "{without}");
         assert!(without.contains("Evergreen"), "{without}");
+    }
+
+    #[test]
+    fn task_canceled_is_not_a_profile_retry() {
+        // v0.5.4: Sahand's exact banner — the v0.5.3 retry died at
+        // once with TaskCanceled. That is a stale WM_QUIT from the
+        // previous attempt's destroyed window, NOT a stale profile:
+        // it must never trigger a profile retry, and it must be
+        // distinguishable from the 0x8007139F case.
+        let reason = "WebView2 controller creation failed: TaskCanceled";
+        assert!(!is_invalid_state_error(reason));
+        assert!(!should_retry_window(reason, false));
+        assert!(!should_retry_window(reason, true));
+        // The 0x8007139F case still retries once, as before.
+        let invalid_state = "Navigate failed: Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }";
+        assert!(should_retry_window(invalid_state, false));
+        assert!(!should_retry_window(invalid_state, true));
+    }
+
+    #[test]
+    fn attempt_history_formatting() {
+        // v0.5.4: no attempts — placeholder, never an empty reason.
+        assert_eq!(format_attempt_history(&[]), "WebView2 window failed");
+        // One attempt: its error unchanged (banner text as before).
+        let one = vec!["Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string()];
+        assert_eq!(
+            format_attempt_history(&one),
+            "Navigate failed: Error { code: HRESULT(0x8007139F) }"
+        );
+        // Two attempts (Sahand's v0.5.3 run): the last error first,
+        // the earlier attempt numbered in parentheses.
+        let two = vec![
+            "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+            "WebView2 controller creation failed: TaskCanceled".to_string(),
+        ];
+        let history = format_attempt_history(&two);
+        assert!(
+            history.starts_with("WebView2 controller creation failed: TaskCanceled"),
+            "{history}"
+        );
+        assert!(
+            history.contains("attempt 1: Navigate failed: Error { code: HRESULT(0x8007139F) }"),
+            "{history}"
+        );
+        // Three attempts keep their order.
+        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            format_attempt_history(&three),
+            "c (earlier attempts: attempt 1: a; attempt 2: b)"
+        );
+    }
+
+    #[test]
+    fn attempt_history_keeps_runtime_suffix() {
+        // The final reason is history first, runtime version last —
+        // so the banner shows both what happened on each try and
+        // which Edge runtime is installed.
+        let attempts = vec![
+            "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+            "WebView2 controller creation failed: TaskCanceled".to_string(),
+        ];
+        let reason =
+            failure_with_runtime_info(&format_attempt_history(&attempts), Some("158.0.4370.33"));
+        assert!(reason.contains("attempt 1: Navigate failed"), "{reason}");
+        assert!(reason.contains("TaskCanceled"), "{reason}");
+        assert!(
+            reason.ends_with("[WebView2 runtime 158.0.4370.33]"),
+            "{reason}"
+        );
     }
 }

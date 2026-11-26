@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.5.3)
+# Internet Control — Usage Meter (v0.5.4)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,35 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.5.4 changes (the retry no longer dies at once — stale WM_QUIT drained)
+
+v0.5.3's fresh-profile retry never got a chance to work. The
+banner on Sahand's PC said `WebView2 controller creation failed:
+TaskCanceled [WebView2 runtime 158.0.4370.33]` — and the runtime
+version proves Edge itself is present and current, so this is
+not a missing or broken Edge install.
+
+`TaskCanceled` is what the `webview2-com` wait helper returns
+when `GetMessage` retrieves WM_QUIT. The only place that posts
+WM_QUIT is our own window procedure: attempt 1's window is
+destroyed on a retryable failure, WM_DESTROY posts WM_QUIT, and
+nobody pumps messages between the destroy and the retry — so the
+stale quit message is still sitting in the thread's queue when
+attempt 2 starts waiting for the controller, and the wait dies
+at once. (Each attempt creates a fresh window — the retry never
+reuses a destroyed HWND; the poison is the queued WM_QUIT. This
+also explains the window flashing open for a split second and
+then closing: that is attempt 1 being shown and then destroyed.)
+
+So v0.5.4 drains stale WM_QUIT messages (`PeekMessageW` with a
+WM_QUIT filter) before every window attempt, so each attempt
+starts with a clean message queue. The retry also pauses ~500 ms
+first, so a crashed Edge process can exit and release its locks,
+and every attempt is logged (`WebView2 window attempt N …`) and
+listed in the banner reason when the window finally falls back,
+e.g. `… TaskCanceled (earlier attempts: attempt 1: Navigate
+failed: … 0x8007139F) [WebView2 runtime 158.0.4370.33]`.
 
 ## What v0.5.3 changes (fresh WebView2 profile retry + runtime version on screen)
 

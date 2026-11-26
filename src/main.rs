@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.5.3.
+//! Internet Control — usage meter v0.5.4.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -29,6 +29,12 @@
 //! window is retried once with a fresh profile. The runtime version
 //! is logged at startup and appended to the failure reason, so the
 //! banner shows the Edge version too.
+//! v0.5.4: the v0.5.3 retry died at once with TaskCanceled — the
+//! stale WM_QUIT from attempt 1's destroyed window poisoned the
+//! retry's first message pump. Every attempt now drains stale
+//! WM_QUIT messages first, the retry pauses ~500 ms so a crashed
+//! Edge process can exit, and the banner lists what happened on
+//! every attempt.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
