@@ -85,6 +85,15 @@ body {
   background: #2a230f; border: 1px solid #5a4d1d; color: var(--warn);
   border-radius: 8px; padding: 9px 12px; margin: 8px 0;
 }
+/* v0.5.1: why the app's own window could not open — shown at the
+ * very top of the Overview tab only when the UI fell back to the
+ * browser, so the reason is readable off the screen instead of
+ * hiding in internet-control.log. */
+.window-banner {
+  background: #3d2b12; border: 1px solid #8a6d1f; color: #ffd479;
+  border-radius: 8px; padding: 10px 12px; margin: 0 0 10px;
+  font-weight: 600; overflow-wrap: break-word;
+}
 .bignums { display: flex; gap: 48px; flex-wrap: wrap; margin: 10px 0 6px; }
 .bignum-label { font-size: 12px; letter-spacing: 1.5px; color: var(--muted); }
 .bignum-label.down { color: var(--down); }

@@ -309,6 +309,19 @@
     src.textContent = state.capture_label;
     src.parentElement.classList.toggle("fallback", !!(state.top && state.top.note));
 
+    // v0.5.1: the app window could not open — show the recorded
+    // reason at the top of the Overview tab. Only present when the
+    // UI fell back to the browser; hidden when the page is inside
+    // the working app window (window_failure is null then).
+    var wb = $("windowBanner");
+    if (state.window_failure) {
+      wb.textContent = "The app window could not open: " + state.window_failure +
+        " You are seeing the UI in your browser instead.";
+      wb.classList.remove("hidden");
+    } else {
+      wb.classList.add("hidden");
+    }
+
     var note = $("topNote");
     if (state.top && state.top.note) {
       note.textContent = state.top.note + " (Source: " + state.top.source + ")";

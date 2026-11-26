@@ -21,6 +21,10 @@
 //! — `main` then falls back to opening the same URL in the default
 //! browser. `WebView2Loader.dll` is shipped next to the exe by the
 //! release workflow; without it the loader cannot find the runtime.
+//!
+//! v0.5.1: the `Err` string `run()` returns is the failure reason
+//! `main` records in the shared state, so the browser page can show
+//! it as a banner instead of the user hunting for the log file.
 
 #[cfg(windows)]
 mod imp {

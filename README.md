@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.5.0)
+# Internet Control — Usage Meter (v0.5.1)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,23 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.5.1 changes (browser page shows why the app window failed)
+
+On some PCs the app's own WebView2 window never opens and the UI
+only appears in the browser (the v0.4.1 fallback). The exact reason
+was only in `internet-control.log`, which is easy to miss. v0.5.1
+surfaces it: when the window fails, the same reason string —
+including the WebErrorStatus / HRESULT where available, e.g.
+"WebView2 navigation failed (WebErrorStatus 12, HTTP 0)" — is shown
+as a banner at the top of the Overview tab in the browser page:
+
+> The app window could not open: … You are seeing the UI in your
+> browser instead.
+
+The banner only appears when the fallback was actually used; when
+the page is inside the working app window it is hidden. Nothing
+else changes — same v0.5.0 blocking, same log file.
 
 ## What v0.5.0 changes (Block terminates open connections)
 
@@ -92,9 +109,12 @@ was even shown. v0.4.1:
    - `capture status: ...` — which mode the meter is in
      (intercept / sniff / counter fallback) and why.
 2. If the page opened in your **browser** instead of the app's
-   window, WebView2 itself failed — check the log lines above and
-   make sure Edge is installed (Windows 11 has the WebView2
-   runtime built in; on Windows 10 it comes with Edge).
+   window, WebView2 itself failed — since v0.5.1 the reason is shown
+   as a banner at the top of the page itself ("The app window could
+   not open: …"), so read that off the screen first. The log lines
+   above still have the full detail, and make sure Edge is installed
+   (Windows 11 has the WebView2 runtime built in; on Windows 10 it
+   comes with Edge).
 
 ## What v0.4 changes
 

@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.4.1.
+//! Internet Control — usage meter v0.5.1.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -13,6 +13,9 @@
 //! v0.4 UI: a WebView2 (Edge) window showing a local page served by
 //! the loopback HTTP server in `server.rs`. If the WebView2 runtime
 //! is missing, the same page opens in the default browser instead.
+//! v0.5.1: when the window fails, the reason is shown as a banner
+//! at the top of the browser page, so the user can read it off the
+//! screen instead of hunting for the log file.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
@@ -74,6 +77,15 @@ fn main() {
             log::log("window closed, saving config and exiting");
         }
         Err(e) => {
+            // v0.5.1: record the reason in the shared state BEFORE
+            // opening the browser, so the page itself can show it as
+            // a banner ("The app window could not open: …") instead
+            // of the user having to find internet-control.log. The
+            // string is the same one written to the log below,
+            // including WebErrorStatus / HRESULT where available.
+            if let Ok(mut slot) = shared.window_failure.lock() {
+                *slot = Some(e.clone());
+            }
             log::log(&format!(
                 "WebView2 unavailable ({e}); opening the UI in the default browser: {url}"
             ));
