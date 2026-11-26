@@ -40,6 +40,23 @@
 //! window stays open without the page-loaded check instead of
 //! dropping to the browser. The keep-vs-fallback decision is the
 //! pure `decide_first_nav` below, unit tested without any COM.
+//!
+//! v0.5.3: on Sahand's PC `Navigate` itself then failed with the
+//! SAME HRESULT (0x8007139F) — so the browser process is not just
+//! late, it never starts at all, and the default (crate-chosen)
+//! user-data folder is the prime suspect (a stale / locked profile
+//! from a crashed first run). The environment is now created with
+//! an EXPLICIT user-data folder,
+//! `%LOCALAPPDATA%\InternetControl\WebView2`, and when the window
+//! fails with 0x8007139F the app moves that folder aside and
+//! retries once with a fresh profile. The available runtime version
+//! (`GetAvailableCoreWebView2BrowserVersionString`) is logged at
+//! startup and appended to the failure reason, so the banner shows
+//! the Edge version too — and says explicitly when no runtime is
+//! installed at all (then the fix is installing the Evergreen
+//! WebView2 Runtime). Only our own explicit folder is ever touched,
+//! never any shared Edge folder; the webview only ever shows our
+//! own local page, so its user data is disposable.
 
 /// Plain-data outcome of the first navigation attempt (v0.5.2).
 ///
@@ -107,6 +124,88 @@ fn decide_first_nav(nav: &FirstNav) -> FirstNavDecision {
     }
 }
 
+/// ERROR_INVALID_STATE as printed by `windows::core::Error`'s Debug
+/// impl: `Error { code: HRESULT(0x8007139F), message: "…" }`.
+/// The WebView2 browser process is down / never started. Both
+/// `add_NavigationCompleted` (v0.5.2) and `Navigate` (v0.5.3) fail
+/// with this on Sahand's PC.
+#[cfg(any(windows, test))]
+const HRESULT_INVALID_STATE: &str = "0x8007139f";
+
+/// True when `reason` carries ERROR_INVALID_STATE (0x8007139F).
+/// Pure: no COM, no I/O. Case-insensitive — the HRESULT is printed
+/// in upper-case hex, but never trust a format string.
+#[cfg(any(windows, test))]
+fn is_invalid_state_error(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains(HRESULT_INVALID_STATE)
+}
+
+/// Retry the window once with a fresh profile only for
+/// ERROR_INVALID_STATE, and only once — any other failure, or a
+/// second invalid-state failure, goes straight to the browser.
+/// Pure: no COM, no I/O.
+#[cfg(any(windows, test))]
+fn should_retry_window(reason: &str, already_retried: bool) -> bool {
+    !already_retried && is_invalid_state_error(reason)
+}
+
+/// `%LOCALAPPDATA%\InternetControl\WebView2` — our own explicit
+/// WebView2 user-data folder (v0.5.3). Pure: the base is passed in
+/// so it is testable on any platform.
+#[cfg(any(windows, test))]
+fn user_data_dir_for(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("InternetControl").join("WebView2")
+}
+
+/// Backup name for a stale profile: `WebView2.bak-<unix secs>`,
+/// next to the profile folder. Pure.
+#[cfg(any(windows, test))]
+fn backup_dir_for(dir: &std::path::Path, timestamp_secs: u64) -> std::path::PathBuf {
+    let mut name = dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".bak-{timestamp_secs}"));
+    dir.with_file_name(name)
+}
+
+/// Folder to retry with after a failed profile (v0.5.3). When the
+/// stale folder could be moved aside, retry with the original path
+/// — it is a clean slate now. When it could NOT be moved (locked by
+/// a crashed Edge process, or missing), use a fresh suffixed folder
+/// (`WebView2-<unix secs>`) and never touch the old one. Pure.
+#[cfg(any(windows, test))]
+fn retry_dir_for(
+    dir: &std::path::Path,
+    timestamp_secs: u64,
+    rename_succeeded: bool,
+) -> std::path::PathBuf {
+    if rename_succeeded {
+        dir.to_path_buf()
+    } else {
+        let mut name = dir
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(format!("-{timestamp_secs}"));
+        dir.with_file_name(name)
+    }
+}
+
+/// Append the runtime version to a window-failure reason, so the
+/// v0.5.1 banner shows it. When no runtime was found, say so
+/// explicitly — then the fix is installing the Evergreen WebView2
+/// Runtime. Pure.
+#[cfg(any(windows, test))]
+fn failure_with_runtime_info(reason: &str, runtime_version: Option<&str>) -> String {
+    match runtime_version {
+        Some(v) => format!("{reason} [WebView2 runtime {v}]"),
+        None => format!(
+            "{reason} [WebView2 runtime not found — install the Evergreen WebView2 Runtime]"
+        ),
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::mem;
@@ -130,6 +229,49 @@ mod imp {
         Timeout,
     }
 
+    /// Explicit user-data folder (v0.5.3):
+    /// `%LOCALAPPDATA%\InternetControl\WebView2`, temp dir fallback
+    /// when LOCALAPPDATA is unset. Our own folder only — never any
+    /// shared Edge folder.
+    pub fn webview2_user_data_dir() -> std::path::PathBuf {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        super::user_data_dir_for(&base)
+    }
+
+    /// Available WebView2 runtime version, e.g. `Some("139.0.7258.66")`.
+    /// `None` when no runtime is installed — the loader returns an
+    /// error HRESULT in that case.
+    pub fn browser_version_string() -> Option<String> {
+        unsafe {
+            let mut raw = PWSTR::null();
+            GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut raw).ok()?;
+            if raw.is_null() {
+                return None;
+            }
+            // take_pwstr copies the CoTaskMemAlloc'd string and frees it.
+            let version = take_pwstr(raw);
+            if version.is_empty() {
+                None
+            } else {
+                Some(version)
+            }
+        }
+    }
+
+    /// One window attempt: create the window + control on
+    /// `user_data_folder` and run the first navigation. The caller
+    /// (`run`, below) decides whether a failure is worth one retry
+    /// with a fresh profile.
+    pub fn run_once(
+        url: &str,
+        user_data_folder: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        let view = WebView::create(url, user_data_folder)?;
+        view.run()
+    }
+
     pub struct WebView {
         controller: Rc<ICoreWebView2Controller>,
         webview: Rc<ICoreWebView2>,
@@ -143,7 +285,10 @@ mod imp {
     }
 
     impl WebView {
-        pub fn create(url: &str) -> std::result::Result<WebView, String> {
+        pub fn create(
+            url: &str,
+            user_data_folder: &std::path::Path,
+        ) -> std::result::Result<WebView, String> {
             unsafe {
                 CoInitializeEx(None, COINIT_APARTMENTTHREADED)
                     .ok()
@@ -178,12 +323,30 @@ mod imp {
             };
 
             // Async environment creation, pumped on this thread.
+            // v0.5.3: explicit user-data folder via
+            // CreateCoreWebView2EnvironmentWithOptions — the crate
+            // default left the profile wherever Edge put it, and a
+            // stale / locked profile from a crashed first run is the
+            // prime suspect for the browser process never starting
+            // (0x8007139F on Sahand's PC). The starter closure must
+            // be 'static (Box<dyn FnOnce>), so the folder string is
+            // MOVED into it as an owned CoTaskMemPWSTR — the Create
+            // call copies the path, and the buffer is freed when the
+            // closure is dropped after the call.
+            let folder_wide: CoTaskMemPWSTR<'static> =
+                CoTaskMemPWSTR::from(user_data_folder.to_string_lossy().as_ref());
+            let no_options: Option<&ICoreWebView2EnvironmentOptions> = None;
             let environment = {
                 let (tx, rx) = std::sync::mpsc::channel();
                 CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
-                    Box::new(|handler| unsafe {
-                        CreateCoreWebView2Environment(&handler)
-                            .map_err(webview2_com::Error::WindowsError)
+                    Box::new(move |handler| unsafe {
+                        CreateCoreWebView2EnvironmentWithOptions(
+                            PCWSTR::null(),
+                            *folder_wide.as_ref().as_pcwstr(),
+                            no_options,
+                            &handler,
+                        )
+                        .map_err(webview2_com::Error::WindowsError)
                     }),
                     Box::new(move |error_code, environment| {
                         error_code?;
@@ -591,10 +754,64 @@ mod imp {
 /// Open the WebView2 window on `url` and run its message loop until
 /// the window closes. Returns Err when WebView2 is unavailable —
 /// the caller falls back to the default browser.
+///
+/// v0.5.3: the environment uses an explicit user-data folder
+/// (`%LOCALAPPDATA%\InternetControl\WebView2`), the runtime version
+/// is logged at startup, and when the window fails with
+/// ERROR_INVALID_STATE (0x8007139F — the browser process never
+/// started) the stale profile is moved aside and the window is
+/// retried exactly once with a fresh profile. Any other failure,
+/// or a second invalid-state failure, falls back immediately. The
+/// final failure reason carries the runtime version, so the v0.5.1
+/// banner shows it (and says explicitly when no runtime is
+/// installed at all).
 #[cfg(windows)]
 pub fn run(url: &str) -> Result<(), String> {
-    let view = imp::WebView::create(url)?;
-    view.run()
+    let folder = imp::webview2_user_data_dir();
+    crate::log::log(&format!("WebView2 user data folder: {}", folder.display()));
+    let runtime_version = imp::browser_version_string();
+    match &runtime_version {
+        Some(v) => crate::log::log(&format!("WebView2 runtime version: {v}")),
+        None => crate::log::log("WebView2 runtime version: not found (no runtime installed)"),
+    }
+
+    let mut dir = folder;
+    let mut retried = false;
+    loop {
+        match imp::run_once(url, &dir) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if should_retry_window(&e, retried) {
+                    retried = true;
+                    let ts = now_secs();
+                    let backup = backup_dir_for(&dir, ts);
+                    let renamed = std::fs::rename(&dir, &backup).is_ok();
+                    if renamed {
+                        crate::log::log(&format!(
+                            "WebView2 profile moved aside to {} after 0x8007139F; retrying with a fresh profile",
+                            backup.display()
+                        ));
+                    } else {
+                        crate::log::log(
+                            "WebView2 profile could not be moved aside (locked by a crashed Edge process or missing); retrying with a fresh profile folder",
+                        );
+                    }
+                    dir = retry_dir_for(&dir, ts, renamed);
+                    continue;
+                }
+                return Err(failure_with_runtime_info(&e, runtime_version.as_deref()));
+            }
+        }
+    }
+}
+
+/// Seconds since the Unix epoch (for backup / fresh folder names).
+#[cfg(windows)]
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Non-Windows stub: there is no WebView2 here; the caller prints
@@ -672,5 +889,88 @@ mod tests {
                 "waiting for navigation failed: Error { code: HRESULT(0x80004005), message: \"Unspecified error\" }".to_string()
             )
         );
+    }
+
+    #[test]
+    fn navigate_invalid_state_falls_back_but_is_retried_once() {
+        // v0.5.3: Sahand's exact banner — Navigate failed with
+        // 0x8007139F. decide_first_nav still says fallback (the
+        // window cannot show the page), but should_retry_window
+        // says the caller gets one retry with a fresh profile.
+        let reason = "Navigate failed: Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }";
+        assert_eq!(
+            decide_first_nav(&FirstNav::NavigateFailed(reason.to_string())),
+            FirstNavDecision::Fallback(reason.to_string())
+        );
+        assert!(should_retry_window(reason, false));
+        assert!(!should_retry_window(reason, true));
+    }
+
+    #[test]
+    fn retry_only_on_invalid_state_hresult() {
+        // Any other HRESULT — including the neighbouring code — is
+        // not a stale-profile case and must never trigger a retry.
+        assert!(!should_retry_window(
+            "Navigate failed: Error { code: HRESULT(0x80004005), message: \"Unspecified error\" }",
+            false
+        ));
+        assert!(!should_retry_window(
+            "WebView2 runtime not available: Error { code: HRESULT(0x80040154), message: \"Class not registered\" }",
+            false
+        ));
+        assert!(!is_invalid_state_error(
+            "Navigate failed: Error { code: HRESULT(0x8007139E), message: \"Something else\" }"
+        ));
+        assert!(!should_retry_window(
+            "WebView2 navigation timed out after 15 s; see internet-control.log",
+            false
+        ));
+        // Detection is case-insensitive: lower-case hex still matches.
+        assert!(is_invalid_state_error("hresult(0x8007139f)"));
+        assert!(is_invalid_state_error(
+            "Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }"
+        ));
+    }
+
+    #[test]
+    fn user_data_folder_layout() {
+        // v0.5.3: %LOCALAPPDATA%\InternetControl\WebView2.
+        let base = std::path::Path::new("/tmp/fake-local");
+        assert_eq!(
+            user_data_dir_for(base),
+            std::path::PathBuf::from("/tmp/fake-local/InternetControl/WebView2")
+        );
+    }
+
+    #[test]
+    fn backup_and_retry_folder_names() {
+        let dir = std::path::Path::new("/tmp/fake-local/InternetControl/WebView2");
+        assert_eq!(
+            backup_dir_for(dir, 1_795_651_200),
+            std::path::PathBuf::from("/tmp/fake-local/InternetControl/WebView2.bak-1795651200")
+        );
+        // Rename succeeded: retry reuses the original (now clean) folder.
+        assert_eq!(retry_dir_for(dir, 1_795_651_200, true), dir.to_path_buf());
+        // Rename failed (locked by a crashed Edge process, or the
+        // folder was never created): fresh suffixed folder, the old
+        // one untouched.
+        assert_eq!(
+            retry_dir_for(dir, 1_795_651_200, false),
+            std::path::PathBuf::from("/tmp/fake-local/InternetControl/WebView2-1795651200")
+        );
+    }
+
+    #[test]
+    fn failure_string_carries_runtime_version() {
+        let reason = "Navigate failed: Error { code: HRESULT(0x8007139F) }";
+        let with = failure_with_runtime_info(reason, Some("139.0.7258.66"));
+        assert!(with.starts_with(reason), "{with}");
+        assert!(with.contains("139.0.7258.66"), "{with}");
+        // No runtime at all: say so explicitly, so the banner tells
+        // Sahand the fix is installing the Evergreen runtime.
+        let without = failure_with_runtime_info(reason, None);
+        assert!(without.starts_with(reason), "{without}");
+        assert!(without.contains("not found"), "{without}");
+        assert!(without.contains("Evergreen"), "{without}");
     }
 }

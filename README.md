@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.5.2)
+# Internet Control — Usage Meter (v0.5.3)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,34 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.5.3 changes (fresh WebView2 profile retry + runtime version on screen)
+
+v0.5.2's fix worked as far as it could — the handler failure went
+away — but on Sahand's PC `Navigate` itself then failed with the
+same ERROR_INVALID_STATE (`0x8007139F`): the WebView2 browser
+process never starts at all, not just late. The prime suspect is
+the user-data folder: the crate default left the profile wherever
+Edge put it, and a stale or locked profile from a crashed first
+run can keep the browser process from starting.
+
+So v0.5.3 uses an EXPLICIT user-data folder,
+`%LOCALAPPDATA%\InternetControl\WebView2`, and when the window
+fails with `0x8007139F` the app moves that folder aside (to
+`WebView2.bak-<timestamp>`) and retries exactly once with a fresh
+profile. If the old folder cannot be moved (a crashed Edge process
+still holds a lock on it), the retry uses a fresh folder with a
+suffix instead (`WebView2-<timestamp>`). Only our own explicit
+folder is ever touched — never any shared Edge folder — and the
+webview only ever shows our own local page, so its user data is
+disposable: nothing of the user's is stored there.
+
+v0.5.3 also logs the available WebView2 runtime version at
+startup (`GetAvailableCoreWebView2BrowserVersionString`) and
+appends it to the failure reason, so the banner now shows the
+Edge version too, e.g. `… [WebView2 runtime 139.0.7258.66]`. If
+no runtime is found at all, the banner says so explicitly —
+then the fix is installing the Evergreen WebView2 Runtime.
 
 ## What v0.5.2 changes (Minimal graph + window keeps trying when the page-loaded check fails)
 
@@ -134,6 +162,17 @@ was even shown. v0.4.1:
      could not be registered (usually `0x8007139F`, browser process
      not up yet); since v0.5.2 the app navigates anyway and only
      falls back if `Navigate` itself fails.
+   - `WebView2 user data folder: ...` / `WebView2 runtime version:
+     <n>` — v0.5.3 logs the explicit profile folder
+     (`%LOCALAPPDATA%\InternetControl\WebView2`) and the Edge
+     version at startup. `not found` here means no WebView2
+     runtime is installed — install the Evergreen WebView2
+     Runtime.
+   - `WebView2 profile moved aside to ... after 0x8007139F;
+     retrying with a fresh profile` — v0.5.3 retried the window
+     once with a clean profile after an invalid-state failure. If
+     the next line is a navigation success, the stale profile was
+     the problem.
    - `WebView2 navigation started without NavigationCompleted;
      keeping the app window open` — the window is kept without the
      check; the page renders when it renders.

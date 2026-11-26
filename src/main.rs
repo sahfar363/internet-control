@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.5.2.
+//! Internet Control — usage meter v0.5.3.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -21,6 +21,14 @@
 //! also no longer gives up when registering the NavigationCompleted
 //! handler fails (0x8007139F) — it navigates anyway and only falls
 //! back to the browser if Navigate itself fails.
+//! v0.5.3: on Sahand's PC `Navigate` itself then failed with the
+//! same 0x8007139F, so the browser process never starts at all. The
+//! environment now uses an explicit user-data folder
+//! (`%LOCALAPPDATA%\InternetControl\WebView2`); when the window
+//! fails with 0x8007139F the stale profile is moved aside and the
+//! window is retried once with a fresh profile. The runtime version
+//! is logged at startup and appended to the failure reason, so the
+//! banner shows the Edge version too.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
