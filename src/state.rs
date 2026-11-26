@@ -716,6 +716,12 @@ pub struct StateJson {
     pub selected_luid: Option<u64>,
     pub selected_name: String,
     pub selected_ip: String,
+    /// Public IP as the internet sees it (v0.9), e.g.
+    /// "203.0.113.7 (Japan)". `None` while no lookup has succeeded
+    /// yet — the UI then shows "unavailable" and falls back to the
+    /// local adapter IP. Written by the lookup thread in
+    /// `crate::public_ip`, read by the bridge.
+    pub public_ip: Option<String>,
     /// Which adapters the top numbers come from (v0.7).
     pub adapter_mode: AdapterSelection,
     pub minimal: bool,
@@ -756,6 +762,10 @@ pub struct Shared {
     /// Note from the last Block click (v0.5 termination report),
     /// written by the egui UI, read by the bridge.
     pub block_note: Mutex<Option<String>>,
+    /// Public IP + country from the lookup thread (v0.9). `None`
+    /// until the first successful lookup; a failed lookup keeps the
+    /// last good value instead of clearing it.
+    pub public_ip: RwLock<Option<crate::public_ip::PublicIp>>,
 }
 
 impl Shared {
@@ -784,6 +794,7 @@ impl Shared {
             sort_request: Mutex::new(None),
             startup_request: Mutex::new(None),
             block_note: Mutex::new(None),
+            public_ip: RwLock::new(None),
         }
     }
 }
@@ -1423,6 +1434,14 @@ impl Bridge {
             selected_luid: self.selected_luid,
             selected_name,
             selected_ip,
+            // Public IP (v0.9): formatted by the lookup value, or
+            // None until the first successful lookup.
+            public_ip: self
+                .shared
+                .public_ip
+                .read()
+                .ok()
+                .and_then(|s| s.as_ref().map(|ip| ip.display())),
             adapter_mode: self.adapter_mode.clone(),
             minimal,
             run_on_startup,

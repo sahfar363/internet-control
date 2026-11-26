@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.8.0.
+//! Internet Control — usage meter v0.9.0.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -30,6 +30,13 @@
 //! match to a program, with an Identify action that looks each one
 //! up in the current connection tables. Kernel (PID 4) traffic gets
 //! its own "System" row instead of landing under Unknown.
+//! v0.9: borderless window — the Windows title bar is hidden and
+//! the app draws its own slim title bar with minimize / maximize /
+//! close buttons, drag to move and edge drag to resize; the IP line
+//! shows the public IP + country (fetched every 5 minutes, with a
+//! local-IP fallback when offline); the Minimal window gets its
+//! live graph lines back; and the whole UI scales with the window
+//! size (the window can also be made smaller than before).
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
@@ -40,6 +47,7 @@ mod connections;
 mod log;
 mod meter;
 mod opacity;
+mod public_ip;
 mod startup;
 mod state;
 mod store;
@@ -71,13 +79,24 @@ fn main() {
         }
     });
 
-    // Native egui window. Resizable in both views, with a sensible
-    // minimum size so the tables stay usable when small.
+    // Public IP + country lookup thread (v0.9): one fetch now, then
+    // every 5 minutes. Only this display needs the internet; the
+    // meter itself stays fully offline, and a failed lookup keeps
+    // the last good value.
+    let ip_shared = shared.clone();
+    std::thread::spawn(move || crate::public_ip::run_loop(ip_shared));
+
+    // Native egui window. Borderless (v0.9): the Windows title bar
+    // is hidden and the app draws its own slim title bar with
+    // minimize / maximize / close (see `app.rs`). Resizable in both
+    // views, with a small minimum size so the window can be made
+    // genuinely smaller than before.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Internet Control — Usage Meter")
+            .with_decorations(false)
             .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([560.0, 420.0])
+            .with_min_inner_size([420.0, 320.0])
             .with_resizable(true),
         ..Default::default()
     };

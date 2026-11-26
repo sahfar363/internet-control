@@ -7,15 +7,23 @@
 //! store + SetTcpEntry termination, as the old `/api/block` did).
 //!
 //! Layout (clean and minimal):
-//! * Top bar: title, opacity slider, Dark/Light theme toggle,
-//!   Minimal toggle, run-on-startup checkbox.
-//! * Big DOWNLOAD / UPLOAD rates + session totals + the carrying
-//!   adapter's name and IP — shown in BOTH normal and minimal view.
+//! * Borderless window (v0.9): no Windows title bar — the app draws
+//!   its own slim title bar with minimize / maximize / close, drag
+//!   to move, double-click to maximize, edge drag to resize.
+//! * Top bar: opacity slider, Dark/Light theme toggle, Minimal
+//!   toggle, run-on-startup checkbox.
+//! * Big DOWNLOAD / UPLOAD rates + session totals + the public IP
+//!   (v0.9: the IP + country as the internet sees it, with the
+//!   local adapter IP as fallback) — shown in BOTH normal and
+//!   minimal view.
 //! * Tabs (full view): Overview (graph + totals + capture status),
 //!   Apps (per-app list with Block/Unblock), Adapters (adapter list
-//!   + diagnostics). Minimal view (v0.7): the window itself shrinks
-//!     to a really small size — just the rates, the opacity slider and
-//!     the IP, no graph, no tabs.
+//!   + diagnostics). Minimal view (v0.7, graph restored in v0.9):
+//!     the window itself shrinks to a really small size — rates,
+//!     live graph, opacity slider, IP.
+//! * The whole UI scales with the window width (v0.9), so resizing
+//!   grows/shrinks the content instead of leaving empty space; the
+//!   window can also be made smaller than before.
 //! * Everything scrolls: the whole panel is a vertical ScrollArea,
 //!   so nothing is cut off when the window is short; the tables
 //!   scroll horizontally when the window is narrow. The window is
@@ -48,12 +56,52 @@ const UP_COLOR: Color32 = Color32::from_rgb(255, 170, 60);
 /// Really-small Minimal window (v0.7): just the rates, the opacity
 /// slider and the IP. The window itself shrinks to this size when
 /// Minimal is clicked — v0.6 only hid panels and left the window big.
-pub const MINIMAL_SIZE: [f32; 2] = [360.0, 190.0];
+/// v0.9 adds the live graph back, so the window grows a little to
+/// fit it (~360x260): rates, graph, slider, IP.
+pub const MINIMAL_SIZE: [f32; 2] = [360.0, 260.0];
 /// Smallest the Minimal window can be dragged to.
 pub const MINIMAL_MIN_SIZE: [f32; 2] = [300.0, 150.0];
 /// Normal view size / minimum (set in `main.rs` too — keep in sync).
+/// v0.9 lowers the minimum (was 560x420): Sahand could not make the
+/// window smaller, and with UI scaling the content still fits.
 pub const NORMAL_SIZE: [f32; 2] = [980.0, 720.0];
-pub const NORMAL_MIN_SIZE: [f32; 2] = [560.0, 420.0];
+pub const NORMAL_MIN_SIZE: [f32; 2] = [420.0, 320.0];
+
+/// UI scaling (v0.9): the whole UI scales with the window width
+/// against the width the layout was designed for, so resizing the
+/// window actually grows/shrinks the content instead of leaving
+/// empty space. Clamped so text never gets unreadably small or
+/// absurdly large. Applied via `pixels_per_point` each frame.
+pub const SCALE_MIN: f32 = 0.6;
+pub const SCALE_MAX: f32 = 1.5;
+pub const DESIGN_WIDTH_NORMAL: f32 = 980.0;
+pub const DESIGN_WIDTH_MINIMAL: f32 = 360.0;
+
+/// Borderless window (v0.9): height of the app-drawn title bar,
+/// and the thickness of the invisible edge strips the window is
+/// resized by.
+pub const TITLE_BAR_HEIGHT: f32 = 30.0;
+pub const RESIZE_EDGE: f32 = 6.0;
+/// Corner squares are bigger than the edge strips so they are easy
+/// to grab.
+pub const RESIZE_CORNER: f32 = 12.0;
+
+/// Scale factor for the UI at a given window width (v0.9): the
+/// window width divided by the design width, clamped to
+/// 0.6..=1.5. Pure — unit-tested.
+pub fn scale_factor(window_width: f32, design_width: f32) -> f32 {
+    let design = if design_width.is_finite() && design_width > 0.0 {
+        design_width
+    } else {
+        DESIGN_WIDTH_NORMAL
+    };
+    let width = if window_width.is_finite() && window_width > 0.0 {
+        window_width
+    } else {
+        design
+    };
+    (width / design).clamp(SCALE_MIN, SCALE_MAX)
+}
 
 /// Fixed widths (px) for the numeric columns: values never shift
 /// left/right as numbers change, because the column width is
@@ -123,6 +171,10 @@ pub struct MeterApp {
     /// Identify results for unknown samples (v0.8): sample key ->
     /// owner label from the last Identify click.
     unknown_owners: HashMap<String, String>,
+    /// Whether the OS currently has the window maximized (v0.9):
+    /// read from the viewport each frame, so the title-bar button
+    /// shows the restore icon while maximized.
+    maximized: bool,
 }
 
 impl MeterApp {
@@ -147,6 +199,7 @@ impl MeterApp {
             normal_size: None,
             selected_app: None,
             unknown_owners: HashMap::new(),
+            maximized: false,
         }
     }
 
@@ -202,6 +255,245 @@ impl MeterApp {
     fn set_adapter_mode(&mut self, mode: AdapterSelection) {
         if let Ok(mut req) = self.shared.adapter_mode_request.lock() {
             *req = Some(mode);
+        }
+    }
+
+    // --- Borderless window (v0.9) -------------------------------------
+    // The Windows title bar is hidden (`with_decorations(false)` in
+    // `main.rs`), so the app draws its own slim title bar with
+    // minimize / maximize / close, drag to move, double-click to
+    // maximize, and invisible edge strips to resize from. The icons
+    // are drawn with the painter (lines, not font glyphs) so they
+    // always render. Closing the window quits the app — blocking
+    // stops and traffic flows again, exactly as before.
+
+    /// The app-drawn title bar. Returns nothing; the buttons send
+    /// viewport commands directly. Drawn at the top of the central
+    /// panel, OUTSIDE the scroll area, in both views.
+    fn draw_title_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, minimal: bool) {
+        let width = ui.available_width();
+        let (bar_rect, bar_resp) = ui.allocate_exact_size(
+            Vec2::new(width, TITLE_BAR_HEIGHT),
+            egui::Sense::click_and_drag(),
+        );
+        let visuals = ui.visuals();
+        let bg = visuals.widgets.noninteractive.bg_fill;
+        ui.painter().rect_filled(bar_rect, 0.0, bg);
+        ui.painter().hline(
+            bar_rect.x_range(),
+            bar_rect.bottom(),
+            Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
+        );
+        let text_color = visuals.text_color();
+        let title = if minimal {
+            "Internet Control".to_string()
+        } else {
+            format!("Internet Control — Usage Meter  v{VERSION}")
+        };
+        ui.painter().text(
+            bar_rect.left_center() + Vec2::new(10.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            title,
+            egui::FontId::proportional(13.0),
+            text_color,
+        );
+
+        // Window buttons, right-aligned: minimize, maximize/restore,
+        // close. Each is a 40px-wide hit area with a painted icon.
+        let btn_w = 40.0;
+        let mut x = bar_rect.right();
+        // Close is drawn last (rightmost) but handled first below;
+        // the order here only decides the x positions.
+        let close_rect = egui::Rect::from_min_size(
+            egui::pos2(x - btn_w, bar_rect.top()),
+            Vec2::new(btn_w, TITLE_BAR_HEIGHT),
+        );
+        x -= btn_w;
+        let max_rect = egui::Rect::from_min_size(
+            egui::pos2(x - btn_w, bar_rect.top()),
+            Vec2::new(btn_w, TITLE_BAR_HEIGHT),
+        );
+        x -= btn_w;
+        let min_rect = egui::Rect::from_min_size(
+            egui::pos2(x - btn_w, bar_rect.top()),
+            Vec2::new(btn_w, TITLE_BAR_HEIGHT),
+        );
+        let painter = ui.painter();
+        let draw_btn =
+            |rect: egui::Rect, hovered: bool, icon: &dyn Fn(&egui::Painter, egui::Rect)| {
+                if hovered {
+                    painter.rect_filled(rect, 0.0, visuals.widgets.hovered.bg_fill);
+                }
+                icon(painter, rect);
+            };
+        // Minimize: a horizontal line.
+        let min_resp = ui.interact(min_rect, ui.id().with("win_min"), egui::Sense::click());
+        draw_btn(min_rect, min_resp.hovered(), &|p, r| {
+            let y = r.center().y + 3.0;
+            p.line_segment(
+                [
+                    egui::pos2(r.center().x - 5.0, y),
+                    egui::pos2(r.center().x + 5.0, y),
+                ],
+                Stroke::new(1.5_f32, text_color),
+            );
+        });
+        if min_resp.clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        // Maximize / restore: a square, or two overlapping squares
+        // while maximized.
+        let max_resp = ui.interact(max_rect, ui.id().with("win_max"), egui::Sense::click());
+        let maximized = self.maximized;
+        draw_btn(max_rect, max_resp.hovered(), &|p, r| {
+            let c = r.center();
+            if maximized {
+                // Restore: back square offset up-right, front square.
+                let back =
+                    egui::Rect::from_center_size(c + Vec2::new(2.0, -2.0), Vec2::new(8.0, 8.0));
+                p.rect_stroke(
+                    back,
+                    0.0,
+                    Stroke::new(1.5_f32, text_color),
+                    egui::StrokeKind::Middle,
+                );
+                let front =
+                    egui::Rect::from_center_size(c + Vec2::new(-2.0, 2.0), Vec2::new(8.0, 8.0));
+                p.rect_filled(front, 0.0, bg);
+                p.rect_stroke(
+                    front,
+                    0.0,
+                    Stroke::new(1.5_f32, text_color),
+                    egui::StrokeKind::Middle,
+                );
+            } else {
+                let sq = egui::Rect::from_center_size(c, Vec2::new(9.0, 9.0));
+                p.rect_stroke(
+                    sq,
+                    0.0,
+                    Stroke::new(1.5_f32, text_color),
+                    egui::StrokeKind::Middle,
+                );
+            }
+        });
+        if max_resp.clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+        // Close: an X. Hover paints it red, like Windows does.
+        let close_resp = ui.interact(close_rect, ui.id().with("win_close"), egui::Sense::click());
+        if close_resp.hovered() {
+            painter.rect_filled(close_rect, 0.0, Color32::from_rgb(200, 60, 60));
+        }
+        {
+            let p = ui.painter();
+            let c = close_rect.center();
+            let s = 4.5;
+            let col = if close_resp.hovered() {
+                Color32::WHITE
+            } else {
+                text_color
+            };
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+                Stroke::new(1.5_f32, col),
+            );
+            p.line_segment(
+                [egui::pos2(c.x + s, c.y - s), egui::pos2(c.x - s, c.y + s)],
+                Stroke::new(1.5_f32, col),
+            );
+        }
+        if close_resp.clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Drag the bar to move the window; double-click toggles
+        // maximize. `drag_started` only fires when the press began
+        // on the bar itself (not on a button), which is exactly
+        // what `StartDrag` requires.
+        if bar_resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if bar_resp.double_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+    }
+
+    /// Invisible resize strips along the window edges and corners
+    /// (v0.9). A borderless window has no OS resize border, so
+    /// without these it could not be resized at all. Each strip is
+    /// a foreground area with a drag sense; the drag hands the
+    /// resize to the OS (`BeginResize`), which is what makes it
+    /// work while the button is held. Skipped while maximized.
+    fn draw_resize_edges(&self, ctx: &egui::Context) {
+        let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) else {
+            return;
+        };
+        let (w, h) = (size.x, size.y);
+        let e = RESIZE_EDGE;
+        let c = RESIZE_CORNER;
+        let zones: [(egui::ResizeDirection, egui::Pos2, Vec2, egui::CursorIcon); 8] = [
+            (
+                egui::ResizeDirection::North,
+                egui::pos2(c, 0.0),
+                Vec2::new(w - 2.0 * c, e),
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (
+                egui::ResizeDirection::South,
+                egui::pos2(c, h - e),
+                Vec2::new(w - 2.0 * c, e),
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (
+                egui::ResizeDirection::West,
+                egui::pos2(0.0, c),
+                Vec2::new(e, h - 2.0 * c),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (
+                egui::ResizeDirection::East,
+                egui::pos2(w - e, c),
+                Vec2::new(e, h - 2.0 * c),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (
+                egui::ResizeDirection::NorthWest,
+                egui::pos2(0.0, 0.0),
+                Vec2::new(c, c),
+                egui::CursorIcon::ResizeNwSe,
+            ),
+            (
+                egui::ResizeDirection::NorthEast,
+                egui::pos2(w - c, 0.0),
+                Vec2::new(c, c),
+                egui::CursorIcon::ResizeNeSw,
+            ),
+            (
+                egui::ResizeDirection::SouthWest,
+                egui::pos2(0.0, h - c),
+                Vec2::new(c, c),
+                egui::CursorIcon::ResizeNeSw,
+            ),
+            (
+                egui::ResizeDirection::SouthEast,
+                egui::pos2(w - c, h - c),
+                Vec2::new(c, c),
+                egui::CursorIcon::ResizeNwSe,
+            ),
+        ];
+        for (dir, pos, zone_size, cursor) in zones {
+            egui::Area::new(egui::Id::new(format!("resize_{dir:?}")))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let (_, resp) = ui.allocate_exact_size(zone_size, egui::Sense::drag());
+                    if resp.hovered() {
+                        ctx.set_cursor_icon(cursor);
+                    }
+                    if resp.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                    }
+                });
         }
     }
 
@@ -293,20 +585,38 @@ impl MeterApp {
             ));
         });
         ui.add_space(2.0);
-        // The carrying adapter's IP — shown in BOTH normal and
-        // minimal view (v0.6 requirement).
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("IP: {}", snap.selected_ip)).strong());
-            ui.label(format!("  Adapter: {}", snap.selected_name));
-        });
+        // The PUBLIC IP + country (v0.9) — the IP as the internet
+        // sees it (the VPN exit IP), not the local adapter IP.
+        // While no lookup has succeeded yet, show "unavailable"
+        // and fall back to the local adapter IP with a note.
+        match &snap.public_ip {
+            Some(ip) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Public IP: {ip}")).strong());
+                    ui.label(format!(
+                        "  Adapter: {} (local {})",
+                        snap.selected_name, snap.selected_ip
+                    ));
+                });
+            }
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Public IP: unavailable").strong());
+                    ui.label(format!(
+                        "  (local IP {} — showing adapter IP until the lookup succeeds)",
+                        snap.selected_ip
+                    ));
+                });
+            }
+        }
         if let Some(note) = &snap.top.note {
             ui.label(RichText::new(note).small().color(Color32::YELLOW));
         }
     }
 
-    /// The really-small Minimal view (v0.7): just the rates, the
-    /// opacity slider, and the IP underneath — no session totals, no
-    /// graph, no tabs. The window itself is ~360x190 at this point
+    /// The really-small Minimal view (v0.7, graph restored in v0.9):
+    /// rates, live graph, opacity slider, IP underneath — no session
+    /// totals, no tabs. The window itself is ~360x260 at this point
     /// (see `update`), so every line here has to earn its height.
     fn draw_minimal(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
         ui.horizontal(|ui| {
@@ -320,24 +630,46 @@ impl MeterApp {
                 ui.label(RichText::new(&snap.top.up).size(24.0).color(UP_COLOR));
             });
         });
-        ui.add_space(2.0);
+        ui.add_space(4.0);
+        // The live 60-second graph (v0.9): same blue/orange lines
+        // as the Overview graph, from the same history — Sahand
+        // noticed it was missing from the v0.7 Minimal window.
+        self.draw_graph(ui, snap, 70.0);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             // Label + percent take ~90px; the slider gets the rest.
             let slider_w = (ui.available_width() - 90.0).max(60.0);
             self.opacity_slider(ui, slider_w);
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("IP: {}", snap.selected_ip)).strong());
-            ui.label(format!("  {}", snap.selected_name));
-        });
+        // Public IP underneath (v0.9), with the local IP as a
+        // fallback while the lookup has not succeeded yet.
+        match &snap.public_ip {
+            Some(ip) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Public IP: {ip}")).strong());
+                    ui.label(format!("  {}", snap.selected_name));
+                });
+            }
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Public IP: unavailable").strong());
+                    ui.label(format!(
+                        "  local {} • {}",
+                        snap.selected_ip, snap.selected_name
+                    ));
+                });
+            }
+        }
         if let Some(note) = &snap.top.note {
             ui.label(RichText::new(note).small().color(Color32::YELLOW));
         }
     }
 
-    fn draw_graph(&self, ui: &mut egui::Ui, snap: &StateJson) {
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 120.0), egui::Sense::hover());
+    fn draw_graph(&self, ui: &mut egui::Ui, snap: &StateJson, height: f32) {
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), height),
+            egui::Sense::hover(),
+        );
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
         if snap.history_down.len() < 2 {
@@ -386,7 +718,7 @@ impl MeterApp {
             ui.label(RichText::new(note).small().color(Color32::GRAY));
         }
         ui.add_space(6.0);
-        self.draw_graph(ui, snap);
+        self.draw_graph(ui, snap, 120.0);
         ui.add_space(6.0);
         ui.label(format!(
             "Top source: {}  •  Packets seen: {}  •  Adapters found: {}",
@@ -946,6 +1278,24 @@ impl eframe::App for MeterApp {
         ctx.request_repaint_after(Duration::from_millis(100));
         let snap = self.snapshot();
 
+        // --- UI scaling (v0.9) ---
+        // The whole UI scales with the window width against the
+        // design width, so resizing grows/shrinks the content
+        // instead of leaving empty space. `set_pixels_per_point`
+        // divides by the OS DPI factor internally, so this composes
+        // with the system scaling instead of replacing it.
+        let width = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.size().x))
+            .unwrap_or(NORMAL_SIZE[0]);
+        let design = if snap.minimal {
+            DESIGN_WIDTH_MINIMAL
+        } else {
+            DESIGN_WIDTH_NORMAL
+        };
+        ctx.set_pixels_per_point(scale_factor(width, design));
+        // Whether the OS has the window maximized (title-bar icon).
+        self.maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+
         // --- Minimal window size (v0.7) ---
         // The window itself shrinks when Minimal is clicked: v0.6
         // only hid panels and left the window big. The minimum size
@@ -975,13 +1325,17 @@ impl eframe::App for MeterApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Top bar: title, opacity slider (normal view), theme
-            // toggle, Minimal toggle, run-on-startup.
+            // App-drawn title bar (v0.9, borderless window): title +
+            // minimize / maximize / close, drag to move. It sits
+            // above the scroll area so it never scrolls away.
+            let minimal = snap.minimal;
+            self.draw_title_bar(ctx, ui, minimal);
+
+            // Toolbar: opacity slider (normal view), theme toggle,
+            // Minimal toggle, run-on-startup. The title now lives in
+            // the title bar, so there is no heading here any more.
             ui.horizontal(|ui| {
-                if snap.minimal {
-                    ui.heading("Internet Control");
-                } else {
-                    ui.heading(format!("Internet Control — Usage Meter  v{VERSION}"));
+                if !snap.minimal {
                     self.opacity_slider(ui, 90.0);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1018,8 +1372,8 @@ impl eframe::App for MeterApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if snap.minimal {
-                        // Minimal view (v0.7): rates + opacity slider
-                        // + IP. No session totals, no graph, no tabs.
+                        // Minimal view (v0.7, graph restored in
+                        // v0.9): rates + graph + opacity slider + IP.
                         self.draw_minimal(ui, &snap);
                         return;
                     }
@@ -1050,6 +1404,12 @@ impl eframe::App for MeterApp {
                     }
                 });
         });
+
+        // Invisible resize strips (v0.9, borderless window) — not
+        // while maximized, since a maximized window cannot resize.
+        if !self.maximized {
+            self.draw_resize_edges(ctx);
+        }
 
         // Apply the opacity if it changed (v0.7). The HWND comes
         // from the frame; on Linux there is none and this is a no-op.
@@ -1146,6 +1506,8 @@ mod tests {
     // Minimal really is small (v0.7): the window must shrink well
     // below the normal minimum, and the drag minimum must be smaller
     // still, or the window cannot reach the target size at all.
+    // v0.9: Minimal grows to 260 high for the graph, and the normal
+    // minimum drops to 420x320 so the window can be made smaller.
     const _: () = assert!(MINIMAL_SIZE[0] < NORMAL_MIN_SIZE[0]);
     const _: () = assert!(MINIMAL_SIZE[1] < NORMAL_MIN_SIZE[1]);
     const _: () = assert!(MINIMAL_MIN_SIZE[0] < MINIMAL_SIZE[0]);
@@ -1154,13 +1516,38 @@ mod tests {
     const _: () = assert!(MINIMAL_MIN_SIZE[1] >= 100.0);
     const _: () = assert!(NORMAL_SIZE[0] >= NORMAL_MIN_SIZE[0]);
     const _: () = assert!(NORMAL_SIZE[1] >= NORMAL_MIN_SIZE[1]);
+    const _: () = assert!(SCALE_MIN >= 0.1 && SCALE_MIN < 1.0);
+    const _: () = assert!(SCALE_MAX > 1.0 && SCALE_MAX <= 2.0);
+    const _: () = assert!(TITLE_BAR_HEIGHT >= 24.0 && TITLE_BAR_HEIGHT <= 40.0);
+    const _: () = assert!(RESIZE_EDGE >= 4.0 && RESIZE_EDGE < RESIZE_CORNER);
 
     #[test]
     fn minimal_window_target_size() {
-        // ~360x190: rates + slider + IP, nothing else.
-        assert_eq!(MINIMAL_SIZE, [360.0, 190.0]);
+        // ~360x260: rates + graph + slider + IP, nothing else.
+        assert_eq!(MINIMAL_SIZE, [360.0, 260.0]);
         assert_eq!(MINIMAL_MIN_SIZE, [300.0, 150.0]);
         assert_eq!(NORMAL_SIZE, [980.0, 720.0]);
-        assert_eq!(NORMAL_MIN_SIZE, [560.0, 420.0]);
+        assert_eq!(NORMAL_MIN_SIZE, [420.0, 320.0]);
+    }
+
+    #[test]
+    fn scale_factor_tracks_window_width_and_clamps() {
+        // At the design width the UI is exactly 1x.
+        assert_eq!(scale_factor(980.0, DESIGN_WIDTH_NORMAL), 1.0);
+        assert_eq!(scale_factor(360.0, DESIGN_WIDTH_MINIMAL), 1.0);
+        // Wider window: content grows, up to the 1.5 cap.
+        assert!((scale_factor(1470.0, DESIGN_WIDTH_NORMAL) - 1.5).abs() < f32::EPSILON);
+        assert!((scale_factor(1960.0, DESIGN_WIDTH_NORMAL) - 1.5).abs() < f32::EPSILON);
+        assert!((scale_factor(1225.0, DESIGN_WIDTH_NORMAL) - 1.25).abs() < f32::EPSILON);
+        // Narrower window: content shrinks, down to the 0.6 floor.
+        assert!((scale_factor(490.0, DESIGN_WIDTH_NORMAL) - 0.6).abs() < f32::EPSILON);
+        assert!((scale_factor(420.0, DESIGN_WIDTH_NORMAL) - 0.6).abs() < f32::EPSILON);
+        assert!((scale_factor(784.0, DESIGN_WIDTH_NORMAL) - 0.8).abs() < f32::EPSILON);
+        // Minimal at its smallest drag size stays readable.
+        assert!((scale_factor(300.0, DESIGN_WIDTH_MINIMAL) - 0.833_333_3).abs() < 1e-6);
+        // Degenerate inputs fall back instead of panicking/NaN.
+        assert_eq!(scale_factor(0.0, DESIGN_WIDTH_NORMAL), 1.0);
+        assert_eq!(scale_factor(f32::NAN, DESIGN_WIDTH_NORMAL), 1.0);
+        assert_eq!(scale_factor(980.0, 0.0), 1.0);
     }
 }

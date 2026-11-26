@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.8.0)
+# Internet Control — Usage Meter (v0.9.0)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a native
 egui UI (complete Rust, no WebView2/Edge) that shows **real, precise
@@ -9,6 +9,50 @@ with block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.9.0 changes (borderless window, public IP + country, Minimal graph, UI scaling)
+
+Sahand tested v0.7.0 and asked for four things:
+
+- **Borderless window with in-app controls** — the Windows title
+  bar ("the windows container on top of the app") is hidden, and
+  the app draws its own slim title bar instead: title on the left,
+  minimize / maximize / close buttons on the right, in both normal
+  and Minimal views. Drag the title bar to move the window,
+  double-click it to maximize/restore, and drag any edge or corner
+  to resize (the window has no OS resize border any more, so the
+  app provides invisible resize strips along all edges and
+  corners). Closing the window still quits the app — blocking stops
+  and traffic flows again, exactly as before. The buttons follow
+  the app's dark/light theme.
+- **Public IP + country instead of the local adapter IP** — the IP
+  line used to show the local adapter IP (e.g. PDaNet's internal
+  10.1.19.2). It now shows the public IP as the internet sees it —
+  the VPN exit IP — with the country: "Public IP: 1.2.3.4
+  (Country)", in both normal and Minimal views. A background
+  thread looks it up roughly every 5 minutes from a what-is-my-ip
+  service (ipapi.co, with ip-api.com as a fallback). While offline
+  or when the lookup fails it shows "Public IP: unavailable" and
+  falls back to the local adapter IP — the meter itself never needs
+  the internet and never waits on this. The per-adapter local IPs
+  on the Adapters tab are unchanged. Privacy note: the lookup
+  service necessarily sees the public IP — that is what the
+  service is for. Nothing else is sent: a plain GET, no body, no
+  identifier, no account.
+- **Graph lines back in Minimal** — v0.7.0 dropped the live
+  60-second download/upload graph from the really-small Minimal
+  window, and Sahand noticed. It is back: the same blue download /
+  orange upload lines as the Overview graph, from the same
+  history. The Minimal window grows a little to fit it (~360x260)
+  and keeps the order: download/upload lines, graph, opacity
+  slider, IP underneath.
+- **Content scales when resizing, and the window can be made
+  smaller** — resizing used to only make the frame bigger while
+  the content stayed the same size, and the window could not go
+  below 560x420. Now the whole UI scales with the window width
+  (0.6x–1.5x against the design width), so text, rates, buttons
+  and the graph all grow/shrink with the window, and the normal
+  minimum is now 420x320. Scrolling still works for tall content.
 
 ## What v0.8.0 changes (exact file location per app, identify the Unknown traffic)
 
@@ -469,7 +513,7 @@ meter shows 0. Counting the actual packets is the only way.
 
 ## Install
 
-1. Download `internet-control-v0.8.0-windows-x64.zip` from Releases.
+1. Download `internet-control-v0.9.0-windows-x64.zip` from Releases.
 2. Unzip it anywhere. **Keep all files together in the same folder**
    — the exe will not work properly on its own: `internet-control.exe`,
    `WinDivert.dll`, `WinDivert64.sys` (the WinDivert 2.2.2 driver

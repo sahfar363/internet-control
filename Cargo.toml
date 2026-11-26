@@ -1,8 +1,8 @@
 [package]
 name = "internet-control"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.8.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, really-small Minimal view with opacity slider, dark/light theme, multi-adapter selection, full exe paths and Unknown-traffic identification."
+description = "Internet Control — precise Windows internet usage meter (v0.9.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, really-small Minimal view with opacity slider, dark/light theme, multi-adapter selection, full exe paths and Unknown-traffic identification, borderless window with in-app controls, public IP + country lookup."
 license = "MIT"
 
 [dependencies]
@@ -16,6 +16,16 @@ etherparse = "0.13"
 # Getting the window handle for the opacity slider (v0.7): eframe's
 # Frame implements HasWindowHandle from this crate.
 raw-window-handle = "0.6"
+# Public IP + country lookup (v0.9): blocking HTTP client.
+# `native-tls` uses the OS TLS stack — SChannel on Windows, OpenSSL
+# on Linux — so the Windows target needs no C compiler (rustls/ring
+# would, and the sandbox has no lib.exe). Default features are off
+# so rustls/ring are not pulled in at all; `charset` is kept for
+# `Response::into_string`, and `proxy-from-env` honours HTTP_PROXY /
+# HTTPS_PROXY when set (corporate networks) and connects directly
+# otherwise. Used only by the background lookup thread — the meter
+# itself stays fully offline.
+ureq = { version = "2", default-features = false, features = ["native-tls", "charset", "proxy-from-env"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
