@@ -43,11 +43,12 @@ jobs:
           Copy-Item $env:WINDIVERT_PATH\WinDivert.dll dist\
           Copy-Item $env:WINDIVERT_PATH\WinDivert64.sys dist\
           Copy-Item README.md dist\
-          Compress-Archive -Path dist\* -DestinationPath "internet-control-$version-windows-x64.zip"
+          Compress-Archive -Path dist\* -DestinationPath "internet-control-v$version-windows-x64.zip"
+          Get-FileHash "internet-control-v$version-windows-x64.zip" -Algorithm SHA256 | Format-List
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: internet-control-*-windows-x64.zip
+          files: internet-control-v*-windows-x64.zip
           body: |
             Internet Control meter v${{ github.ref_name }} — Windows x64.
             Native egui UI (Overview / Apps / Adapters tabs), top-numbers fallback + Diagnostics, stable app list with Rate/Total view, dark/light theme, scrolling, resizable Minimal view.
