@@ -649,6 +649,23 @@ pub struct AppJson {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct UnknownSampleJson {
+    /// Stable identity, e.g. "TCP 10.0.0.5:52341 -> 93.184.216.34:443".
+    pub key: String,
+    /// "TCP" / "UDP" / "ICMP" / "Other".
+    pub protocol: String,
+    pub local: String,
+    pub remote: String,
+    pub bytes: u64,
+    pub bytes_fmt: String,
+    pub packets: u64,
+    /// Seconds since this sample was last seen (computed at
+    /// snapshot time, so the UI can say "last seen 3s ago").
+    pub last_seen_ago_secs: u64,
+    pub last_seen_ago: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IfTotalJson {
     pub index: u32,
     pub down: u64,
@@ -689,6 +706,12 @@ pub struct StateJson {
     pub history_up: Vec<f64>,
     pub adapters: Vec<AdapterJson>,
     pub apps: Vec<AppJson>,
+    /// Unattributed traffic samples (v0.8), biggest first.
+    pub unknown_samples: Vec<UnknownSampleJson>,
+    /// Raw unknown samples for the Identify action (v0.8). Not
+    /// serialized — the JSON form above is what the UI renders.
+    #[serde(skip)]
+    pub unknown_raw: Vec<crate::unknown::UnknownSample>,
     pub diagnostics: DiagnosticsJson,
     pub selected_luid: Option<u64>,
     pub selected_name: String,
@@ -1280,6 +1303,27 @@ impl Bridge {
                 }
             })
             .collect();
+        // Unattributed traffic samples (v0.8): what the "Unknown"
+        // row is made of. "Last seen" is computed here, at snapshot
+        // time, so the UI shows a fresh "3s ago" on every tick.
+        let unknown_samples_json: Vec<UnknownSampleJson> = batch
+            .unknown
+            .iter()
+            .map(|s| {
+                let ago = s.last_seen.elapsed().as_secs();
+                UnknownSampleJson {
+                    key: s.key(),
+                    protocol: crate::unknown::protocol_name(s.protocol).to_string(),
+                    local: s.local.to_string(),
+                    remote: s.remote.to_string(),
+                    bytes: s.bytes,
+                    bytes_fmt: format_bytes(s.bytes),
+                    packets: s.packets,
+                    last_seen_ago_secs: ago,
+                    last_seen_ago: crate::unknown::format_ago(ago),
+                }
+            })
+            .collect();
         // What the top strip shows as the source (v0.7). Auto: the
         // single selected adapter. All: "All adapters" with the IP
         // of the busiest one. Named: the requested names joined, with
@@ -1363,6 +1407,8 @@ impl Bridge {
             history_up: self.history.iter().map(|(_, u)| *u).collect(),
             adapters: adapters_json,
             apps: apps_json,
+            unknown_samples: unknown_samples_json,
+            unknown_raw: batch.unknown.clone(),
             diagnostics: DiagnosticsJson {
                 capture_totals,
                 adapters_enumerated: batch.adapters.len(),

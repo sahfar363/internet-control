@@ -35,7 +35,10 @@
 //! (and dropped when blocked) instead of falling under "Unknown".
 //! ICMP / non-TCP-UDP packets have no flow at all — those bytes are
 //! still counted in the totals, under "Unknown (unattributed)", never
-//! lost. Attribution is best-effort and never breaks the total meter:
+//! lost. v0.8 records what that traffic is (`crate::unknown`) so the
+//! Unknown row can be opened and identified, and attributes PID 4
+//! (Windows kernel) flows to a "System" row instead of Unknown.
+//! Attribution is best-effort and never breaks the total meter:
 //! if the flow handle fails, per-app rows are empty but the totals
 //! keep working exactly as in v0.2.
 //!
@@ -102,6 +105,28 @@ impl FlowKey {
     }
 }
 
+use crate::unknown::UnknownSample;
+
+/// Parse the IP layer of one packet: (source, destination,
+/// protocol). Shared by `parse_flow_key` and `parse_packet_addrs`.
+/// Pure — no WinDivert dependency, tested on Linux.
+#[allow(dead_code)] // only called from Windows code + tests
+fn parse_ip_addrs(data: &[u8]) -> Option<(IpAddr, IpAddr, u8)> {
+    let headers = etherparse::PacketHeaders::from_ip_slice(data).ok()?;
+    match headers.ip? {
+        etherparse::IpHeader::Version4(h, _) => Some((
+            IpAddr::V4(h.source.into()),
+            IpAddr::V4(h.destination.into()),
+            h.protocol,
+        )),
+        etherparse::IpHeader::Version6(h, _) => Some((
+            IpAddr::V6(h.source.into()),
+            IpAddr::V6(h.destination.into()),
+            h.next_header,
+        )),
+    }
+}
+
 /// Parse the 5-tuple out of one IP packet. `outbound == true` means
 /// the packet is leaving this PC, so its source is the local side;
 /// for inbound packets the destination is the local side. Returns
@@ -110,18 +135,7 @@ impl FlowKey {
 #[allow(dead_code)] // only called from Windows code + tests
 pub fn parse_flow_key(data: &[u8], outbound: bool) -> Option<FlowKey> {
     let headers = etherparse::PacketHeaders::from_ip_slice(data).ok()?;
-    let (src, dst, protocol) = match headers.ip? {
-        etherparse::IpHeader::Version4(h, _) => (
-            IpAddr::V4(h.source.into()),
-            IpAddr::V4(h.destination.into()),
-            h.protocol,
-        ),
-        etherparse::IpHeader::Version6(h, _) => (
-            IpAddr::V6(h.source.into()),
-            IpAddr::V6(h.destination.into()),
-            h.next_header,
-        ),
-    };
+    let (src, dst, protocol) = parse_ip_addrs(data)?;
     let (src_port, dst_port) = match headers.transport? {
         etherparse::TransportHeader::Tcp(h) => (h.source_port, h.destination_port),
         etherparse::TransportHeader::Udp(h) => (h.source_port, h.destination_port),
@@ -139,6 +153,16 @@ pub fn parse_flow_key(data: &[u8], outbound: bool) -> Option<FlowKey> {
         remote,
         remote_port,
     ))
+}
+
+/// Parse the addresses out of one packet that has no flow (ICMP):
+/// (protocol, local, remote), local side first like `parse_flow_key`.
+/// Pure — no WinDivert dependency, tested on Linux.
+#[allow(dead_code)] // only called from Windows code + tests
+pub fn parse_packet_addrs(data: &[u8], outbound: bool) -> Option<(u8, IpAddr, IpAddr)> {
+    let (src, dst, protocol) = parse_ip_addrs(data)?;
+    let (local, remote) = if outbound { (src, dst) } else { (dst, src) };
+    Some((protocol, local, remote))
 }
 
 /// Shared live 5-tuple -> PID map, written by the flow thread and
@@ -259,6 +283,9 @@ impl PacketCounter {
             totals: self.totals.clone(),
             apps: self.apps.clone(),
             packets: self.packets,
+            // Unknown samples are attached by the capture thread
+            // (v0.8); the counter itself does not record them.
+            unknown: Vec::new(),
         }
     }
 }
@@ -272,6 +299,10 @@ pub struct CaptureSnapshot {
     pub apps: HashMap<String, IfTotals>,
     /// Total packets counted so far, across all interfaces.
     pub packets: u64,
+    /// Unattributed traffic samples (v0.8): the flows the meter
+    /// could not match to a program, biggest first, at most 50.
+    /// Empty in counter mode (no capture running).
+    pub unknown: Vec<UnknownSample>,
 }
 
 /// What the UI should show as the measurement source.
@@ -488,7 +519,7 @@ pub(crate) fn exe_for_pid(pid: u32) -> Option<String> {
 
 #[cfg(not(windows))]
 #[allow(dead_code)] // Windows version is used on Windows; stub exists for tests
-fn exe_for_pid(_pid: u32) -> Option<String> {
+pub(crate) fn exe_for_pid(_pid: u32) -> Option<String> {
     None
 }
 
@@ -510,7 +541,12 @@ fn capture_thread(
     blocked: Arc<RwLock<HashSet<String>>>,
     intercept: bool,
 ) {
+    use crate::unknown::UnknownSampleStore;
+
     let mut counter = PacketCounter::new();
+    // Unattributed traffic samples (v0.8): what the "Unknown"
+    // row is made of, so the UI can show and identify it.
+    let mut unknown = UnknownSampleStore::new();
     // PID -> exe path cache. A PID is only reused after its process
     // exits, and a relaunched app usually has the same path, so a
     // stale entry is harmless for a meter; failures (None) are cached
@@ -532,18 +568,29 @@ fn capture_thread(
         let outbound = packet.address.outbound();
         let if_index = packet.address.interface_index();
         let len = packet.data.len() as u64;
+        // The 5-tuple, parsed once: attribution uses it, and an
+        // unattributed packet is recorded as an unknown sample
+        // with it (v0.8). None for ICMP / non-TCP-UDP packets.
+        let key = parse_flow_key(&packet.data, outbound);
         // Attribute the packet to an app, if its flow is known.
         // FLOW map first (live flows); on a miss, the v0.5 fallback
         // maps from the connection tables (flows that started before
         // this app launched, incl. UDP by local socket).
         let exe: Option<String> = (|| {
-            let key = parse_flow_key(&packet.data, outbound)?;
+            let key = key?;
             let pid = flow_map
                 .read()
                 .ok()?
                 .get(&key)
                 .copied()
                 .or_else(|| crate::connections::fallback_pid(&key, &tcp_fb, &udp_fb))?;
+            // PID 4 is the Windows kernel (v0.8): attribute its
+            // flows to a "System" row instead of Unknown, where the
+            // PID is known. The UI offers no Block button for it —
+            // dropping the kernel's packets would break networking.
+            if pid == crate::unknown::SYSTEM_PID {
+                return Some(crate::unknown::SYSTEM_EXE.to_string());
+            }
             exe_cache
                 .entry(pid)
                 .or_insert_with(|| exe_for_pid(pid))
@@ -572,14 +619,32 @@ fn capture_thread(
         counter.add(if_index, outbound, len);
         match exe {
             Some(path) => counter.add_app(&path, outbound, len),
-            None => counter.add_app(UNKNOWN_APP, outbound, len),
+            None => {
+                counter.add_app(UNKNOWN_APP, outbound, len);
+                // Record what this unattributed packet was (v0.8),
+                // so the Unknown row can be opened and identified:
+                // TCP/UDP by 5-tuple, anything else (ICMP) by peer.
+                let now = Instant::now();
+                match key {
+                    Some(k) => unknown.record_flow(&k, len, now),
+                    None => {
+                        if let Some((proto, local, remote)) =
+                            parse_packet_addrs(&packet.data, outbound)
+                        {
+                            unknown.record_packet(proto, local, remote, len, now);
+                        }
+                    }
+                }
+            }
         }
         // Send a snapshot at most every 100 ms. Sparse traffic
         // still sends promptly: after a packet, the elapsed time
         // since the last send is usually already > 100 ms.
         if last_send.elapsed() >= Duration::from_millis(100) {
             last_send = Instant::now();
-            if tx.send(counter.snapshot()).is_err() {
+            let mut snap = counter.snapshot();
+            snap.unknown = unknown.snapshot();
+            if tx.send(snap).is_err() {
                 break; // UI gone.
             }
         }
@@ -734,6 +799,38 @@ mod tests {
         assert!(parse_flow_key(&icmp, true).is_none());
         // Garbage is not a packet.
         assert!(parse_flow_key(&[1, 2, 3], true).is_none());
+    }
+
+    #[test]
+    fn parse_packet_addrs_for_icmp_and_tcp() {
+        use etherparse::PacketBuilder;
+        // ICMP: no flow key, but the addresses + protocol are known
+        // — that is what the v0.8 unknown sample records.
+        let mut icmp = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 5], [8, 8, 8, 8], 64)
+            .icmpv4_echo_request(1, 1)
+            .write(&mut icmp, &[1, 2])
+            .unwrap();
+        let (proto, local, remote) = parse_packet_addrs(&icmp, true).unwrap();
+        assert_eq!(proto, 1);
+        assert_eq!(local, IpAddr::from([10, 0, 0, 5]));
+        assert_eq!(remote, IpAddr::from([8, 8, 8, 8]));
+        // Same packet seen inbound: local/remote swap.
+        let (_, local_in, remote_in) = parse_packet_addrs(&icmp, false).unwrap();
+        assert_eq!(local_in, IpAddr::from([8, 8, 8, 8]));
+        assert_eq!(remote_in, IpAddr::from([10, 0, 0, 5]));
+        // TCP packets have addresses too (used only when the flow
+        // key is missing — normally the flow key is used instead).
+        let mut tcp = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 5], [93, 184, 216, 34], 64)
+            .tcp(52341, 443, 1, 65535)
+            .write(&mut tcp, &[1, 2, 3, 4])
+            .unwrap();
+        let (proto, local, remote) = parse_packet_addrs(&tcp, true).unwrap();
+        assert_eq!(proto, 6);
+        assert_eq!(local, IpAddr::from([10, 0, 0, 5]));
+        assert_eq!(remote, IpAddr::from([93, 184, 216, 34]));
+        assert!(parse_packet_addrs(&[1, 2, 3], true).is_none());
     }
 
     #[test]

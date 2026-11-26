@@ -1,8 +1,8 @@
 [package]
 name = "internet-control"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.7.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, really-small Minimal view with opacity slider, dark/light theme, multi-adapter selection."
+description = "Internet Control — precise Windows internet usage meter (v0.8.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, really-small Minimal view with opacity slider, dark/light theme, multi-adapter selection, full exe paths and Unknown-traffic identification."
 license = "MIT"
 
 [dependencies]

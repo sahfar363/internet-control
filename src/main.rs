@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.7.0.
+//! Internet Control — usage meter v0.8.0.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -23,7 +23,13 @@
 //! itself shrinks to ~360x190 with just rates + opacity slider +
 //! IP), adds the opacity slider (layered window, Windows only),
 //! and lets the top numbers sum several adapters at once (Auto /
-//! All / ticked adapters on the Adapters tab).
+//! All / ticked adapters on the Adapters tab). v0.8 shows the exact
+//! on-disk location of every app in the list (hover / click a row,
+//! Copy button) and identifies the "Unknown (unattributed)" traffic:
+//! the Unknown row opens a panel of the flows the meter could not
+//! match to a program, with an Identify action that looks each one
+//! up in the current connection tables. Kernel (PID 4) traffic gets
+//! its own "System" row instead of landing under Unknown.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
@@ -37,6 +43,7 @@ mod opacity;
 mod startup;
 mod state;
 mod store;
+mod unknown;
 
 use std::sync::mpsc;
 use std::sync::Arc;

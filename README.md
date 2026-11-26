@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.7.0)
+# Internet Control — Usage Meter (v0.8.0)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a native
 egui UI (complete Rust, no WebView2/Edge) that shows **real, precise
@@ -9,6 +9,44 @@ with block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.8.0 changes (exact file location per app, identify the Unknown traffic)
+
+Sahand asked: "I want to be able to see the exact location of each
+file that is using the internet. Also what is unauthorized? it should
+be possible to find the app." v0.8.0 answers both:
+
+- **Exact location of every app** — the Apps list still shows only
+  the exe name (compact), but hovering a row now shows a tooltip
+  with the full on-disk path, and clicking a row shows a details
+  line under the list with the full path and a **Copy** button. The
+  path is the exact location the engine captured (PID ->
+  `QueryFullProcessImageName`), never a guess. The block note under
+  the list now names the full path too ("Terminated 3 open TCP
+  connections for C:\Program Files\...\chrome.exe").
+- **Identify the "Unknown (unattributed)" row** — clicking that row
+  opens a panel listing the flows the meter could not match to a
+  program (at most the last 50, biggest first): protocol, local
+  addr:port, remote addr:port, bytes, packets, last seen. Only
+  unattributed traffic is recorded — nothing for attributed apps.
+  An **Identify** button looks each sample up in the *current*
+  connection tables (`GetExtendedTcpTable` /
+  `GetExtendedUdpTable` -> PID -> exe path) and shows the owner
+  next to it when found.
+- **Honest labels for what cannot be owned** — ICMP samples are
+  labelled "ICMP (ping/traceroute — no app owns this, the remote
+  IP is shown)". Traffic from PID 4 (the Windows kernel) is no
+  longer lumped under Unknown at all: it gets its own **System**
+  row with path `C:\Windows\System32\ntoskrnl.exe`. That row
+  cannot be blocked — dropping the kernel's packets would break
+  networking, so it has no Block button (same for the Unknown row
+  itself: there is no app to block). A sample whose connection has
+  since closed, or that started after the sample was recorded,
+  shows "no owner found right now" — the tables only know about
+  right now, so the panel says so instead of guessing.
+- The v0.5 fallback attribution (connection-table map rebuilt
+  ~1/s) is unchanged — Identify is on top of it, for what still
+  misses.
 
 ## What v0.7.0 changes (really-small Minimal, opacity slider, multi-adapter)
 
@@ -90,7 +128,7 @@ carries over from the WebView UI:
 - **IP in both views** — the carrying adapter's IP is shown under
   the big numbers in normal and in Minimal view.
 - The termination note ("Terminated 3 open TCP connections for
-  chrome.exe") is shown under the Apps list, as before.
+  C:\Program Files\...\chrome.exe") is shown under the Apps list, as before.
 - `internet-control.log` next to the exe is kept (the exe still
   has no console window), with capture-status changes and Block
   actions.
@@ -431,7 +469,7 @@ meter shows 0. Counting the actual packets is the only way.
 
 ## Install
 
-1. Download `internet-control-v0.7.0-windows-x64.zip` from Releases.
+1. Download `internet-control-v0.8.0-windows-x64.zip` from Releases.
 2. Unzip it anywhere. **Keep all files together in the same folder**
    — the exe will not work properly on its own: `internet-control.exe`,
    `WinDivert.dll`, `WinDivert64.sys` (the WinDivert 2.2.2 driver

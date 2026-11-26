@@ -113,6 +113,10 @@ pub struct SampleBatch {
     pub capture_totals: HashMap<u32, IfTotals>,
     /// `capture_totals` summed over all interfaces.
     pub capture_total_all: IfTotals,
+    /// Unattributed traffic samples (v0.8), from the capture
+    /// thread — what the "Unknown" row is made of. Empty in
+    /// counter mode.
+    pub unknown: Vec<crate::unknown::UnknownSample>,
 }
 
 #[allow(dead_code)] // used by the Windows enumeration path
@@ -456,6 +460,8 @@ pub fn sample_loop(
         // Per-app readings for this tick (capture mode only; the
         // counter fallback has no attribution, so the list is empty).
         let mut app_readings: Vec<AppReading> = Vec::new();
+        // Unattributed traffic samples (v0.8) for this tick.
+        let mut unknown: Vec<crate::unknown::UnknownSample> = Vec::new();
         // Raw capture totals for this tick (diagnostics + the
         // top-totals fallback). Empty in counter mode.
         let mut capture_totals: HashMap<u32, IfTotals> = HashMap::new();
@@ -463,6 +469,7 @@ pub fn sample_loop(
         if capture_status.is_active() {
             let snap = last_snapshot.clone().unwrap_or_default();
             capture_totals = snap.totals.clone();
+            unknown = snap.unknown.clone();
             capture_total_all =
                 capture_totals
                     .values()
@@ -543,6 +550,7 @@ pub fn sample_loop(
                 apps: app_readings,
                 capture_totals,
                 capture_total_all,
+                unknown,
             })
             .is_err()
         {

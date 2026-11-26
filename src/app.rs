@@ -25,16 +25,19 @@
 //!   change (the v0.3 complaint). The app list keeps the bridge's
 //!   stable order — re-sorted only on header click or view toggle.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Color32, RichText, Stroke, Vec2};
 
+use crate::capture::UNKNOWN_APP;
 use crate::meter::{format_bytes, format_rate};
 use crate::opacity::{OPACITY_MAX, OPACITY_MIN};
 use crate::state::{
     adapter_mode_after_click, AdapterSelection, AppView, BlockState, Shared, SortMode, StateJson,
 };
+use crate::unknown::is_system_exe;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -114,6 +117,12 @@ pub struct MeterApp {
     minimal: bool,
     /// Last full-view window size, so leaving Minimal restores it.
     normal_size: Option<Vec2>,
+    /// Exe path of the row the user clicked (v0.8): its details
+    /// (full path + Copy, or the Unknown panel) show under the list.
+    selected_app: Option<String>,
+    /// Identify results for unknown samples (v0.8): sample key ->
+    /// owner label from the last Identify click.
+    unknown_owners: HashMap<String, String>,
 }
 
 impl MeterApp {
@@ -136,6 +145,8 @@ impl MeterApp {
             applied_opacity: None,
             minimal: false,
             normal_size: None,
+            selected_app: None,
+            unknown_owners: HashMap::new(),
         }
     }
 
@@ -240,7 +251,9 @@ impl MeterApp {
         }
         if block {
             let report = crate::connections::terminate_app_connections(exe_path);
-            let note = report.summarize(&crate::adapters::display_name_for(exe_path));
+            // The note names the FULL path (v0.8) — that is the
+            // exact location of the file that was blocked.
+            let note = report.summarize(exe_path);
             crate::log::log(&format!("Block {exe_path}: {note}"));
             if let Ok(mut n) = self.shared.block_note.lock() {
                 *n = Some(note);
@@ -537,22 +550,53 @@ impl MeterApp {
                     ui.end_row();
                     for row in &snap.apps {
                         let blocked = row.blocked;
+                        let is_unknown = row.exe_path == UNKNOWN_APP;
+                        let is_system = is_system_exe(&row.exe_path);
+                        let is_selected =
+                            self.selected_app.as_deref() == Some(row.exe_path.as_str());
                         let name = if blocked {
                             format!("⛔ {}", row.name)
                         } else {
                             row.name.clone()
                         };
-                        let name_text = if blocked {
+                        let mut name_text = if blocked {
                             RichText::new(name)
                                 .strong()
                                 .color(Color32::from_rgb(255, 120, 120))
                         } else {
                             RichText::new(name)
                         };
-                        ui.add_sized(
+                        // The selected row is underlined, so the
+                        // details panel below is visibly attached
+                        // to it.
+                        if is_selected {
+                            name_text = name_text.strong().underline();
+                        }
+                        // Click the name to select the row (v0.8):
+                        // the details panel under the list shows
+                        // the full path (or the Unknown panel).
+                        // Hover shows the exact location — the list
+                        // itself stays compact with exe names only.
+                        let name_resp = ui.add_sized(
                             Vec2::new(name_w, 18.0),
-                            egui::Label::new(name_text).truncate(),
+                            egui::Label::new(name_text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
                         );
+                        let hover = if is_unknown {
+                            "Traffic the meter could not match to a program — click for details"
+                                .to_string()
+                        } else {
+                            row.exe_path.clone()
+                        };
+                        let name_resp = name_resp.on_hover_text(hover);
+                        if name_resp.clicked() {
+                            if is_selected {
+                                self.selected_app = None;
+                            } else {
+                                self.selected_app = Some(row.exe_path.clone());
+                            }
+                        }
                         ui.add_sized(
                             Vec2::new(RATE_COL_W, 18.0),
                             egui::Label::new(num_cell(&row.down)).halign(egui::Align::RIGHT),
@@ -580,10 +624,21 @@ impl MeterApp {
                                         .color(Color32::from_rgb(255, 120, 120)),
                                 );
                             }
-                            let label = block_button_label(blocked);
-                            let btn = egui::Button::new(label);
-                            if ui.add_enabled(snap.can_block || blocked, btn).clicked() {
-                                to_toggle = Some((row.exe_path.clone(), !blocked));
+                            // The Unknown row has no app to block
+                            // (there is nothing to drop), and the
+                            // System row must never be blocked —
+                            // dropping the kernel's packets would
+                            // break networking. No button for either.
+                            if is_unknown {
+                                ui.label(RichText::new("—").small().color(Color32::GRAY));
+                            } else if is_system {
+                                ui.label(RichText::new("can't block").small().color(Color32::GRAY));
+                            } else {
+                                let label = block_button_label(blocked);
+                                let btn = egui::Button::new(label);
+                                if ui.add_enabled(snap.can_block || blocked, btn).clicked() {
+                                    to_toggle = Some((row.exe_path.clone(), !blocked));
+                                }
                             }
                         });
                         ui.end_row();
@@ -599,6 +654,9 @@ impl MeterApp {
             let can_block = snap.can_block;
             self.set_block(&exe, block, can_block);
         }
+        // Row details (v0.8): full path + Copy for an app, or the
+        // Unknown panel for the unattributed row.
+        self.draw_app_details(ui, snap);
         ui.add_space(4.0);
         ui.label(
             RichText::new(
@@ -609,6 +667,117 @@ impl MeterApp {
             .small()
             .color(Color32::GRAY),
         );
+    }
+
+    /// Details panel under the Apps list (v0.8) for the row the
+    /// user clicked. An app shows its exact on-disk location with a
+    /// Copy button; the Unknown row shows the unattributed samples
+    /// with an Identify action. Clicking the same row again closes
+    /// the panel.
+    fn draw_app_details(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
+        let Some(exe) = self.selected_app.clone() else {
+            return;
+        };
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+        if exe == UNKNOWN_APP {
+            self.draw_unknown_details(ui, snap);
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Location:").strong());
+            ui.label(&exe);
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(exe.clone());
+            }
+            if ui.button("Close").clicked() {
+                self.selected_app = None;
+            }
+        });
+    }
+
+    /// The Unknown panel (v0.8): every unattributed flow the meter
+    /// recorded (at most 50, biggest first), with an Identify button
+    /// that looks each one up in the current connection tables.
+    fn draw_unknown_details(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
+        ui.label(
+            RichText::new("Unknown traffic — flows the meter could not match to a program")
+                .strong(),
+        );
+        ui.label(
+            RichText::new(
+                "These are real packets the meter counted but could not attach to an app — \
+                 usually flows that started before this app launched, or ICMP ping traffic. \
+                 Identify checks each one against the connection tables right now.",
+            )
+            .small()
+            .color(Color32::GRAY),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Identify").clicked() {
+                self.identify_unknown(snap);
+            }
+            ui.label(
+                RichText::new(
+                    "A connection that has since closed, or one that started after the \
+                     sample, may still show no owner — the tables only know about right now.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+            if ui.button("Close").clicked() {
+                self.selected_app = None;
+            }
+        });
+        if snap.unknown_samples.is_empty() {
+            ui.label(
+                RichText::new("No unattributed traffic recorded yet.")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for s in &snap.unknown_samples {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&s.key).monospace());
+                        ui.label(format!(
+                            "• {} • {} packets • last seen {}",
+                            s.bytes_fmt, s.packets, s.last_seen_ago
+                        ));
+                        if let Some(owner) = self.unknown_owners.get(&s.key) {
+                            ui.label(
+                                RichText::new(format!("— {owner}"))
+                                    .small()
+                                    .color(Color32::from_rgb(120, 220, 130)),
+                            );
+                        }
+                    });
+                }
+            });
+    }
+
+    /// "Identify" for the Unknown panel (v0.8): look each recorded
+    /// sample up in the current connection tables and remember the
+    /// owner label per sample key. One-shot — click again to
+    /// refresh. On a non-Windows build the tables are empty, so
+    /// everything reports no owner.
+    fn identify_unknown(&mut self, snap: &StateJson) {
+        let tables = crate::connections::snapshot_tables();
+        for s in &snap.unknown_raw {
+            let result = crate::unknown::identify_sample(s, &tables.tcp, &tables.udp, &|pid| {
+                crate::capture::exe_for_pid(pid)
+            });
+            self.unknown_owners.insert(s.key(), result.label());
+        }
+        crate::log::log(&format!(
+            "Identify: checked {} unknown samples",
+            snap.unknown_raw.len()
+        ));
     }
 
     fn draw_adapters(&mut self, ui: &mut egui::Ui, snap: &StateJson) {
