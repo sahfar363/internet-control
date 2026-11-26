@@ -1,6 +1,6 @@
 [package]
 name = "internet-control"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Internet Control — precise Windows internet usage meter (v0.4). WebView2 UI, WinDivert intercept packet counting with per-app traffic, block/unblock while running, smoother rates and a Minimal view."
 license = "MIT"

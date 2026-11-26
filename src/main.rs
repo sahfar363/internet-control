@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.4.
+//! Internet Control — usage meter v0.4.1.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -18,6 +18,7 @@
 
 mod adapters;
 mod capture;
+mod log;
 mod meter;
 mod server;
 mod startup;
@@ -29,6 +30,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 fn main() {
+    log::init();
+    if let Some(p) = log::path() {
+        log::log(&format!("log file: {}", p.display()));
+    }
+    log::log("Internet Control started");
     let store = store::Store::load();
     let shared = Arc::new(state::Shared::new(store));
 
@@ -49,17 +55,27 @@ fn main() {
     let port = match server::serve(shared.clone()) {
         Ok(port) => port,
         Err(e) => {
+            // No console in a windows_subsystem build, so the log file
+            // is the only record of this failure.
+            log::log(&format!("FATAL: could not start the local UI server: {e}"));
             eprintln!("Could not start the local UI server: {e}");
             std::process::exit(1);
         }
     };
     let url = format!("http://127.0.0.1:{port}/");
+    log::log(&format!("UI server listening on {url}"));
 
     // WebView2 window (Windows). On any failure — no WebView2 runtime,
-    // no Edge — fall back to the default browser on the same URL.
+    // no Edge, navigation failed — fall back to the default browser
+    // on the same URL.
     match webview::run(&url) {
-        Ok(()) => {}
+        Ok(()) => {
+            log::log("window closed, saving config and exiting");
+        }
         Err(e) => {
+            log::log(&format!(
+                "WebView2 unavailable ({e}); opening the UI in the default browser: {url}"
+            ));
             eprintln!("WebView2 unavailable ({e}); opening the UI in the default browser: {url}");
             #[cfg(windows)]
             open_in_browser(&url);

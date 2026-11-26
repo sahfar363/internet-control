@@ -386,12 +386,29 @@
   });
 
   /* ---- poll loop ---- */
+  var firstPollAt = Date.now();
+  var gotData = false;   // any /api/state poll has ever succeeded
+  function showServerWaiting() {
+    // No data from the local server 3 s after load: say so in the
+    // page instead of leaving a silent empty UI. (v0.4.0 swallowed
+    // fetch errors, so a dead server looked like a working page
+    // with all zeros.)
+    if (gotData) return;
+    var err = $("error");
+    err.textContent = "Still waiting for data from the local server — see internet-control.log next to the exe.";
+    err.classList.remove("hidden");
+  }
   function poll() {
     fetch("/api/state")
       .then(function (r) { return r.json(); })
-      .then(function (s) { state = s; render(); })
-      .catch(function () { /* server briefly busy; next tick retries */ });
+      .then(function (s) { state = s; gotData = true; render(); })
+      .catch(function () {
+        // Server briefly busy; next tick retries — but if nothing
+        // has ever arrived, tell the user after 3 s.
+        if (Date.now() - firstPollAt >= 3000) showServerWaiting();
+      });
   }
   poll();
   setInterval(poll, POLL_MS);
+  setTimeout(showServerWaiting, 3000);
 })();

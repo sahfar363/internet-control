@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.4)
+# Internet Control — Usage Meter (v0.4.1)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,59 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.4.1 changes (white-page fix)
+
+v0.4.0 opened to a **white page** on Sahand's PC. The page is
+embedded in the exe, and static HTML renders visible text even if
+the data polling fails — so a fully white page meant the HTML never
+rendered: either navigation failed (and v0.4.0 never checked
+whether it had succeeded) or navigation stalled before the window
+was even shown. v0.4.1:
+
+- the window is **shown first, then navigation starts** — a stuck
+  navigation can no longer leave a hidden window;
+- the first navigation is checked for real success (`IsSuccess` +
+  `WebErrorStatus`) with a **15-second watchdog**. A failed or
+  timed-out navigation **closes the window and opens the same page
+  in the default browser** instead of leaving a blank page;
+- the control bounds are re-applied after showing the window, in
+  case the rect at creation time was empty (a zero-size control
+  renders white even when navigation succeeds);
+- the app now writes **`internet-control.log` next to the exe**
+  (or in the temp folder if the exe folder is not writable), with
+  timestamps: server URL/port at startup, WebView2 navigation
+  success/failure + WebErrorStatus, and capture-status changes
+  (intercept / sniff / counter fallback + reason). The exe has no
+  console window, so this file is the only record of what happened;
+- if no data has arrived from the local server **3 seconds after
+  the page loads**, the page itself says so ("Still waiting for
+  data from the local server — see internet-control.log next to the
+  exe") instead of silently showing zeros.
+
+## If the window is white (or the page is empty)
+
+1. Close the app and look at **`internet-control.log` next to
+   `internet-control.exe`** — send that file (or its last lines)
+   with the report. The lines to look for:
+   - `UI server listening on http://127.0.0.1:<port>/` — the local
+     server started; if this line is missing, the server itself
+     failed to start.
+   - `WebView2 navigation succeeded (HTTP 200)` — the page loaded
+     in the Edge control.
+   - `WebView2 navigation FAILED: WebErrorStatus <n>, HTTP <n>` —
+     the page did not load in the control; the app should have
+     opened the same URL in your default browser instead. Common
+     WebErrorStatus values: 12 = cannot connect (server not
+     reachable), 2 = connection aborted, 3 = timed out.
+   - `WebView2 navigation timed out after 15 s` — navigation never
+     finished; the browser fallback should have opened.
+   - `capture status: ...` — which mode the meter is in
+     (intercept / sniff / counter fallback) and why.
+2. If the page opened in your **browser** instead of the app's
+   window, WebView2 itself failed — check the log lines above and
+   make sure Edge is installed (Windows 11 has the WebView2
+   runtime built in; on Windows 10 it comes with Edge).
 
 ## What v0.4 changes
 
@@ -130,15 +183,18 @@ meter shows 0. Counting the actual packets is the only way.
 
 ## Install
 
-1. Download `internet-control-v0.4.0-windows-x64.zip` from Releases.
-2. Unzip it anywhere. Keep all files together in the same folder:
-   `internet-control.exe`, `WinDivert.dll`, `WinDivert64.sys` (the
-   WinDivert 2.2.2 driver files — without them the meter falls back
-   to counter mode) and `WebView2Loader.dll` (lets the app find the
-   Edge WebView2 runtime).
+1. Download `internet-control-v0.4.1-windows-x64.zip` from Releases.
+2. Unzip it anywhere. **Keep all files together in the same folder**
+   — the exe will not work properly on its own: `internet-control.exe`,
+   `WinDivert.dll`, `WinDivert64.sys` (the WinDivert 2.2.2 driver
+   files — without them the meter falls back to counter mode) and
+   `WebView2Loader.dll` (lets the app find the Edge WebView2 runtime).
 3. Run `internet-control.exe`. It asks for administrator rights
    (UAC prompt) — WinDivert needs them. If you decline, the app
-   still opens but shows the counter fallback and the reason.
+   still opens but shows the counter fallback and the reason. **Run
+   it as administrator** for the real meter: without admin rights
+   WinDivert cannot open, packet counting does not start, and
+   blocking does not work.
 
 No installer, no internet connection needed to run it. Windows 11
 has the WebView2 runtime built in; on Windows 10 it comes with

@@ -636,6 +636,10 @@ pub struct Bridge {
     selection_note: Option<String>,
     last_save: Instant,
     error: Option<String>,
+    /// Last capture-status label written to the log, so a change of
+    /// capture mode (intercept / sniff / counter fallback) is
+    /// recorded once instead of on every 100 ms batch.
+    last_capture_label: String,
     /// "Run on startup" key refreshed once at startup (the exe may
     /// have moved since it was set) — not on every tick.
     /// (Windows only; the Linux stub build never reads it.)
@@ -673,6 +677,7 @@ impl Bridge {
             selection_note: None,
             last_save: Instant::now(),
             error: None,
+            last_capture_label: String::new(),
             startup_checked: false,
         }
     }
@@ -774,6 +779,14 @@ impl Bridge {
     }
 
     pub fn apply(&mut self, batch: SampleBatch) {
+        // Log capture-mode changes once (intercept / sniff / counter
+        // fallback + reason) — the log is the only record on a
+        // windows_subsystem build with no console.
+        let capture_label = batch.capture_status.label();
+        if capture_label != self.last_capture_label {
+            self.last_capture_label = capture_label.clone();
+            crate::log::log(&format!("capture status: {capture_label}"));
+        }
         // --- UI requests -----------------------------------------------
         if let Some(luid) = self
             .shared
