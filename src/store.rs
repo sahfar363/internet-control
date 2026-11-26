@@ -19,6 +19,17 @@ pub struct Config {
     /// Friendly name of the selected adapter (shown / used as a fallback
     /// match if the LUID is gone).
     pub selected_name: Option<String>,
+    /// Full exe paths blocked by the user (v0.3). Blocking itself only
+    /// applies while the app is running (WinDivert intercept drops the
+    /// packets; when the app closes, traffic flows normally again), but
+    /// the *list* is remembered so the same apps are blocked again next
+    /// time the app opens. Nothing is applied at system level.
+    #[serde(default)]
+    pub blocked_exes: Vec<String>,
+    /// "Run on startup" checkbox state (v0.3). The HKCU Run key is
+    /// created/deleted when this changes; see `crate::startup`.
+    #[serde(default)]
+    pub run_on_startup: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

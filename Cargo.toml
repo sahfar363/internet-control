@@ -1,8 +1,8 @@
 [package]
 name = "internet-control"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.2). Counts packets with WinDivert sniff capture, because PDAnet PPP adapters report 0 in the standard counters; falls back to 64-bit counters."
+description = "Internet Control — precise Windows internet usage meter (v0.3). WinDivert intercept packet counting with per-app traffic, block/unblock while running, smoother rates and a Minimal view."
 license = "MIT"
 
 [dependencies]
@@ -10,6 +10,9 @@ eframe = "0.32"
 egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# IP/TCP/UDP header parsing for per-app flow attribution (pure Rust,
+# also used by the unit tests on Linux).
+etherparse = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -17,7 +20,9 @@ windows = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
 # WinDivert 2.2 driver wrapper (stable 0.6.0; 0.7.x is beta). Needs the
 # WinDivert 2.2.2 driver files at build time via WINDIVERT_PATH, and

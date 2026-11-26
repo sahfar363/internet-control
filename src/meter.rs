@@ -37,6 +37,56 @@ pub fn delta_bytes(new_counter: u64, old_counter: u64) -> u64 {
     new_counter.saturating_sub(old_counter)
 }
 
+/// Smoothed display rate (v0.3). Totals stay exact; only what the UI
+/// shows is smoothed, so the 100 ms packet-count jitter Sahand saw in
+/// v0.2 ("numbers so fast") settles into a calm ~1 s average.
+/// Exponential moving average: `value += ALPHA * (raw - value)` per
+/// 100 ms tick, ALPHA = 0.3, so the display converges in ~10 ticks
+/// (about 1 second) and a sudden burst still shows up promptly.
+#[derive(Debug, Clone, Copy)]
+pub struct RateSmoother {
+    value: f64,
+    started: bool,
+}
+
+impl Default for RateSmoother {
+    fn default() -> Self {
+        Self {
+            value: 0.0,
+            started: false,
+        }
+    }
+}
+
+impl RateSmoother {
+    pub const ALPHA: f64 = 0.3;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one raw rate sample (bytes/sec, sampled every ~100 ms) and
+    /// get the smoothed display rate.
+    pub fn update(&mut self, raw: f64) -> f64 {
+        let raw = if raw.is_finite() && raw >= 0.0 {
+            raw
+        } else {
+            0.0
+        };
+        if !self.started {
+            self.value = raw;
+            self.started = true;
+        } else {
+            self.value += Self::ALPHA * (raw - self.value);
+        }
+        self.value
+    }
+
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+}
+
 /// Per-counter rate calculator: keeps the previous reading and turns each
 /// new reading into a rate + a byte delta.
 #[derive(Debug, Default, Clone)]
@@ -213,6 +263,24 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(104_857_600), "100.00 MB");
+    }
+
+    #[test]
+    fn smoother_settles_and_tracks() {
+        let mut s = RateSmoother::new();
+        // First sample is taken as-is.
+        assert_eq!(s.update(1_000_000.0), 1_000_000.0);
+        // A drop to 0 decays by ALPHA per tick, not instantly.
+        let v = s.update(0.0);
+        assert!((v - 700_000.0).abs() < 1.0, "got {v}");
+        // Steady input converges to it.
+        for _ in 0..30 {
+            s.update(500_000.0);
+        }
+        assert!((s.value() - 500_000.0).abs() < 1_000.0, "got {}", s.value());
+        // Negative / NaN input is treated as 0, never poisons the value.
+        s.update(f64::NAN);
+        assert!(s.value().is_finite());
     }
 
     #[test]

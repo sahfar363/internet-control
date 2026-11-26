@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::capture::{CaptureSnapshot, CaptureStatus};
@@ -53,6 +54,41 @@ pub struct AdapterReading {
     pub up_delta: u64,
 }
 
+/// One app's traffic in the current session (v0.3). Rates are raw
+/// per-100 ms samples here; the UI smooths them for display. Totals
+/// are cumulative and exact.
+#[derive(Debug, Clone, Default)]
+pub struct AppReading {
+    /// Full exe path, e.g. `C:\Program Files\...\chrome.exe`. This is
+    /// the identity used for blocking (and for grouping connections).
+    pub exe_path: String,
+    /// File name only, for the list (e.g. `chrome.exe`).
+    pub display_name: String,
+    pub down_bps: f64,
+    pub up_bps: f64,
+    /// Bytes in this 100 ms tick (kept for symmetry with
+    /// AdapterReading; the UI shows rates + cumulative totals).
+    #[allow(dead_code)]
+    pub down_delta: u64,
+    #[allow(dead_code)]
+    pub up_delta: u64,
+    pub down_total: u64,
+    pub up_total: u64,
+}
+
+/// Display name for an exe path: the file name after the last `\` or
+/// `/`; the full path if there is no separator. Pure, tested via the
+/// sampler tests in spirit — see `app.rs` sort tests for coverage of
+/// the list built from these readings.
+pub fn display_name_for(exe_path: &str) -> String {
+    let name = exe_path.rsplit(['\\', '/']).next().unwrap_or(exe_path);
+    if name.is_empty() {
+        exe_path.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SampleBatch {
@@ -61,6 +97,9 @@ pub struct SampleBatch {
     /// How these numbers were measured (WinDivert capture, or the v0.1
     /// counter fallback with the reason capture is unavailable).
     pub capture_status: CaptureStatus,
+    /// Per-app traffic this session (empty in counter-fallback mode,
+    /// where attribution is unavailable).
+    pub apps: Vec<AppReading>,
 }
 
 #[allow(dead_code)] // used by the Windows enumeration path
@@ -326,13 +365,18 @@ fn synthetic_luid(if_index: u32) -> u64 {
 /// 2. Adapter counters (v0.1 fallback) — used only when WinDivert could
 ///    not be opened, e.g. not run as administrator or driver files
 ///    missing. The reason is carried in every batch for the UI.
-pub fn sample_loop(tx: Sender<SampleBatch>) {
-    let capture = crate::capture::try_start();
+pub fn sample_loop(
+    tx: Sender<SampleBatch>,
+    blocked: Arc<RwLock<std::collections::HashSet<String>>>,
+) {
+    let capture = crate::capture::try_start(blocked);
     let mut capture_rx: Option<Receiver<CaptureSnapshot>> = capture.rx;
     let mut capture_status = capture.status;
     let mut last_snapshot: Option<CaptureSnapshot> = None;
     // Rate calculators keyed by interface index (capture mode).
     let mut capture_calcs: HashMap<u32, RateCalculator> = HashMap::new();
+    // Rate calculators keyed by exe path (per-app, capture mode).
+    let mut app_calcs: HashMap<String, RateCalculator> = HashMap::new();
     // Rate calculators keyed by LUID (counter fallback mode).
     let mut counter_calcs: HashMap<u64, RateCalculator> = HashMap::new();
     let mut last = Instant::now();
@@ -357,17 +401,42 @@ pub fn sample_loop(tx: Sender<SampleBatch>) {
             }
         }
         if let Some(snap) = &last_snapshot {
-            if capture_status.is_active() {
+            if let CaptureStatus::Active { intercept, .. } = capture_status {
                 capture_status = CaptureStatus::Active {
                     packets: snap.packets,
+                    intercept,
                 };
             }
         }
 
         let adapters = enumerate_adapters();
         let mut readings = Vec::with_capacity(adapters.len());
+        // Per-app readings for this tick (capture mode only; the
+        // counter fallback has no attribution, so the list is empty).
+        let mut app_readings: Vec<AppReading> = Vec::new();
         if capture_status.is_active() {
             let snap = last_snapshot.clone().unwrap_or_default();
+            // Per-app rates from the cumulative per-app totals, with
+            // the same RateCalculator math as the adapters. Not
+            // filtered to any one interface: WinDivert sees WiFi,
+            // Ethernet, PDAnet and VPN traffic alike, so the list
+            // covers every app using the internet, on any connection.
+            for (exe, totals) in &snap.apps {
+                let calc = app_calcs.entry(exe.clone()).or_default();
+                let s = calc.update(totals.down_bytes, totals.up_bytes, elapsed);
+                app_readings.push(AppReading {
+                    exe_path: exe.clone(),
+                    display_name: display_name_for(exe),
+                    down_bps: s.down_bps,
+                    up_bps: s.up_bps,
+                    down_delta: s.down_delta,
+                    up_delta: s.up_delta,
+                    down_total: totals.down_bytes,
+                    up_total: totals.up_bytes,
+                });
+            }
+            let live_apps: std::collections::HashSet<String> = snap.apps.keys().cloned().collect();
+            app_calcs.retain(|exe, _| live_apps.contains(exe));
             for info in &adapters {
                 let totals = snap.totals.get(&info.index).copied().unwrap_or_default();
                 let calc = capture_calcs.entry(info.index).or_default();
@@ -442,6 +511,7 @@ pub fn sample_loop(tx: Sender<SampleBatch>) {
                 adapters: readings,
                 at: Some(now),
                 capture_status: capture_status.clone(),
+                apps: app_readings,
             })
             .is_err()
         {

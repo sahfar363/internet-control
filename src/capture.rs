@@ -1,44 +1,173 @@
-//! WinDivert packet counting (v0.2).
+//! WinDivert packet counting + per-app attribution + blocking (v0.3).
 //!
-//! Why this exists: v0.1 read the standard adapter counters
+//! Why packet counting exists: v0.1 read the standard adapter counters
 //! (`GetIfTable2` `InOctets` / `OutOctets`). On Sahand's PC those never
 //! move — `Get-NetAdapterStatistics` shows only "Ethernet" 0/0 while the
 //! "PdaNet Broadband Connection" (PPP virtual adapter, 10.1.19.2) carries
-//! all the traffic. The PDAnet driver simply does not update the standard
-//! counters, so every counter-based meter shows 0. Counting the actual
-//! packets is the only way to see that traffic.
+//! all the traffic. Counting the actual packets is the only way.
 //!
-//! How it works: a WinDivert handle on the network layer, filter `true`
-//! (all IP traffic), priority 0, flags SNIFF + RECV_ONLY. In sniff mode
-//! WinDivert delivers a *copy* of each packet and the original keeps
-//! flowing untouched — nothing is blocked, dropped, or re-injected, so
-//! no `send()` call is ever made. Each packet is counted exactly once,
-//! by its IP length (`packet.data.len()`), attributed to the interface
-//! index in its address. Outbound = upload, inbound = download.
-//! Loopback packets are skipped: at the network layer a localhost packet
-//! can appear twice (once outbound, once inbound), and it is not
-//! internet traffic anyway.
+//! v0.3 blocking (design change from Sahand, 2026-11-25): blocking is
+//! WinDivert intercept only — NO firewall rules are ever created, and
+//! nothing persists at system level. The network handle runs in
+//! intercept (non-sniff) mode: every packet is reinjected with
+//! `divert.send()` EXCEPT packets belonging to a blocked app, which are
+//! dropped (never sent, never counted). When the app closes — or
+//! crashes — the handle closes and all traffic flows normally again;
+//! that is the guarantee. If intercept mode cannot be opened, the
+//! handle falls back to v0.2 sniff mode (copies only, no blocking —
+//! the UI says so) and then to the v0.1 counter fallback.
 //!
-//! The pure aggregation (`PacketCounter`) has no WinDivert dependency and
-//! is unit-tested on Linux. Only the `#[cfg(windows)]` thread below
-//! touches the driver. If WinDivert cannot be opened (not admin, driver
-//! files missing), the sampler falls back to the v0.1 counter mode and
-//! the UI says so plainly.
+//! Per-app attribution: network-layer packets carry no PID, so a second
+//! WinDivert handle on the FLOW layer reports flow established/deleted
+//! events with ProcessId + 5-tuple. The capture thread maps each
+//! packet's 5-tuple (parsed with etherparse) to a PID through that
+//! live map, then PID -> exe path via OpenProcess +
+//! QueryFullProcessImageName. Flows that started before the app
+//! launched are not in the map until they reconnect, and ICMP /
+//! non-TCP-UDP packets have no flow at all — those bytes are still
+//! counted in the totals, under "Unknown (unattributed)", never lost.
+//! Attribution is best-effort and never breaks the total meter: if
+//! the flow handle fails, per-app rows are empty but the totals keep
+//! working exactly as in v0.2.
+//!
+//! The pure aggregation (`PacketCounter`, `parse_flow_key`,
+//! `should_drop`, `count_routed`) has no WinDivert dependency and is
+//! unit-tested on Linux. Only the `#[cfg(windows)]` threads touch the
+//! driver.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::mpsc::Receiver;
 #[cfg(windows)]
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
-/// Cumulative captured bytes for one interface index.
+/// Bytes for packets that could not be attributed to an app (flow
+/// started before the app launched, ICMP, or flow handle unavailable).
+/// Shown as its own row in the per-app list so no traffic is hidden.
+/// (Only referenced from Windows code; the allow keeps Linux builds
+/// warning-free — the tests do use it.)
+#[allow(dead_code)]
+pub const UNKNOWN_APP: &str = "Unknown (unattributed)";
+
+/// Cumulative captured bytes for one interface index (or one app).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IfTotals {
-    /// Bytes received (inbound packets) on this interface.
+    /// Bytes received (inbound packets).
     pub down_bytes: u64,
-    /// Bytes sent (outbound packets) on this interface.
+    /// Bytes sent (outbound packets).
     pub up_bytes: u64,
+}
+
+/// A connection 5-tuple, local side first. Used as the key of the
+/// flow map: the flow layer reports local/remote addr + port +
+/// protocol for every established flow, and the capture thread builds
+/// the same key from each packet's headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // only constructed from Windows code + tests
+pub struct FlowKey {
+    pub protocol: u8,
+    pub local: IpAddr,
+    pub local_port: u16,
+    pub remote: IpAddr,
+    pub remote_port: u16,
+}
+
+impl FlowKey {
+    pub fn new(
+        protocol: u8,
+        local: IpAddr,
+        local_port: u16,
+        remote: IpAddr,
+        remote_port: u16,
+    ) -> Self {
+        Self {
+            protocol,
+            local,
+            local_port,
+            remote,
+            remote_port,
+        }
+    }
+}
+
+/// Parse the 5-tuple out of one IP packet. `outbound == true` means
+/// the packet is leaving this PC, so its source is the local side;
+/// for inbound packets the destination is the local side. Returns
+/// None for packets with no TCP/UDP transport header (ICMP etc.).
+/// Pure — no WinDivert dependency, tested on Linux.
+#[allow(dead_code)] // only called from Windows code + tests
+pub fn parse_flow_key(data: &[u8], outbound: bool) -> Option<FlowKey> {
+    let headers = etherparse::PacketHeaders::from_ip_slice(data).ok()?;
+    let (src, dst, protocol) = match headers.ip? {
+        etherparse::IpHeader::Version4(h, _) => (
+            IpAddr::V4(h.source.into()),
+            IpAddr::V4(h.destination.into()),
+            h.protocol,
+        ),
+        etherparse::IpHeader::Version6(h, _) => (
+            IpAddr::V6(h.source.into()),
+            IpAddr::V6(h.destination.into()),
+            h.next_header,
+        ),
+    };
+    let (src_port, dst_port) = match headers.transport? {
+        etherparse::TransportHeader::Tcp(h) => (h.source_port, h.destination_port),
+        etherparse::TransportHeader::Udp(h) => (h.source_port, h.destination_port),
+        _ => return None,
+    };
+    let (local, local_port, remote, remote_port) = if outbound {
+        (src, src_port, dst, dst_port)
+    } else {
+        (dst, dst_port, src, src_port)
+    };
+    Some(FlowKey::new(
+        protocol,
+        local,
+        local_port,
+        remote,
+        remote_port,
+    ))
+}
+
+/// Shared live 5-tuple -> PID map, written by the flow thread and
+/// read by the capture thread.
+#[allow(dead_code)] // only used from Windows code + tests
+pub type FlowMap = Arc<RwLock<HashMap<FlowKey, u32>>>;
+
+/// Should this packet be dropped? Pure decision rule, shared by the
+/// capture thread and the unit tests: drop only when the packet was
+/// attributed to an exe whose (lowercased) full path is in the
+/// blocked set. Unattributed packets are never dropped.
+#[allow(dead_code)] // only called from Windows code + tests
+pub fn should_drop(exe: Option<&str>, blocked: &HashSet<String>) -> bool {
+    match exe {
+        Some(path) => blocked.contains(&path.to_lowercase()),
+        None => false,
+    }
+}
+
+/// Simulate the capture loop's routing over a mock packet stream:
+/// each entry is (attributed exe path or None, byte length).
+/// Returns (packets reinjected, packets dropped, bytes reinjected).
+/// Blocked packets are neither reinjected nor counted — exactly like
+/// the real intercept loop. Pure, tested on Linux.
+#[allow(dead_code)] // only called from tests on Linux
+pub fn count_routed(packets: &[(Option<&str>, u64)], blocked: &HashSet<String>) -> (u64, u64, u64) {
+    let mut reinjected = 0u64;
+    let mut dropped = 0u64;
+    let mut bytes = 0u64;
+    for (exe, len) in packets {
+        if should_drop(*exe, blocked) {
+            dropped += 1;
+        } else {
+            reinjected += 1;
+            bytes += len;
+        }
+    }
+    (reinjected, dropped, bytes)
 }
 
 /// Pure packet aggregator: one `add` call per captured packet, counted
@@ -46,12 +175,12 @@ pub struct IfTotals {
 #[derive(Debug, Default)]
 pub struct PacketCounter {
     totals: HashMap<u32, IfTotals>,
+    apps: HashMap<String, IfTotals>,
     packets: u64,
 }
 
-// The read API (totals/packets/known_interfaces/total_all) is exercised
-// by the unit tests; production code on Windows only needs add() +
-// snapshot(), and on Linux the capture thread is compiled out entirely.
+// The read API is exercised by the unit tests; production code on
+// Windows only needs add()/add_app() + snapshot().
 #[allow(dead_code)]
 impl PacketCounter {
     pub fn new() -> Self {
@@ -72,9 +201,26 @@ impl PacketCounter {
         self.packets += 1;
     }
 
+    /// Record one captured packet against an app (full exe path, or
+    /// [`UNKNOWN_APP`]). Totals stay exact; this is the per-app split
+    /// of the same bytes `add()` counted for the interface.
+    pub fn add_app(&mut self, exe: &str, outbound: bool, len: u64) {
+        let entry = self.apps.entry(exe.to_string()).or_default();
+        if outbound {
+            entry.up_bytes += len;
+        } else {
+            entry.down_bytes += len;
+        }
+    }
+
     /// Cumulative totals for one interface (0/0 if never seen).
     pub fn totals(&self, if_index: u32) -> IfTotals {
         self.totals.get(&if_index).copied().unwrap_or_default()
+    }
+
+    /// Cumulative totals for one app (0/0 if never seen).
+    pub fn app_totals(&self, exe: &str) -> IfTotals {
+        self.apps.get(exe).copied().unwrap_or_default()
     }
 
     /// Total packets counted so far, across all interfaces.
@@ -102,6 +248,7 @@ impl PacketCounter {
     pub fn snapshot(&self) -> CaptureSnapshot {
         CaptureSnapshot {
             totals: self.totals.clone(),
+            apps: self.apps.clone(),
             packets: self.packets,
         }
     }
@@ -112,6 +259,8 @@ impl PacketCounter {
 pub struct CaptureSnapshot {
     /// Cumulative per-interface totals (interface index -> bytes).
     pub totals: HashMap<u32, IfTotals>,
+    /// Cumulative per-app totals (full exe path -> bytes).
+    pub apps: HashMap<String, IfTotals>,
     /// Total packets counted so far, across all interfaces.
     pub packets: u64,
 }
@@ -120,7 +269,10 @@ pub struct CaptureSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureStatus {
     /// WinDivert capture is running; `packets` seen so far.
-    Active { packets: u64 },
+    /// `intercept == true` means blocking works (packets are
+    /// reinjected, blocked apps are dropped); `false` means sniff
+    /// fallback — counting works, blocking does not.
+    Active { packets: u64, intercept: bool },
     /// WinDivert could not be started; `reason` is the driver error.
     /// The meter falls back to the v0.1 adapter-counter mode.
     Unavailable(String),
@@ -136,8 +288,14 @@ impl CaptureStatus {
     /// One-line label for the UI.
     pub fn label(&self) -> String {
         match self {
-            CaptureStatus::Active { packets } => {
-                format!("Source: WinDivert packet capture — {packets} packets seen")
+            CaptureStatus::Active { packets, intercept } => {
+                if *intercept {
+                    format!(
+                        "Source: WinDivert intercept — {packets} packets seen (blocking active)"
+                    )
+                } else {
+                    format!("Source: WinDivert packet capture (sniff) — {packets} packets seen (blocking unavailable)")
+                }
             }
             CaptureStatus::Unavailable(reason) => {
                 format!("Source: adapter counters (fallback) — {reason}")
@@ -147,6 +305,17 @@ impl CaptureStatus {
 
     pub fn is_active(&self) -> bool {
         matches!(self, CaptureStatus::Active { .. })
+    }
+
+    /// Can the Block buttons do anything right now?
+    pub fn can_block(&self) -> bool {
+        matches!(
+            self,
+            CaptureStatus::Active {
+                intercept: true,
+                ..
+            }
+        )
     }
 }
 
@@ -167,27 +336,60 @@ impl CaptureHandle {
     }
 }
 
-/// Try to start WinDivert packet capture. Never panics; on failure the
-/// caller falls back to counter mode with the returned reason.
+/// Start WinDivert capture: flow thread for per-app attribution plus
+/// a network thread in intercept mode (blocking), falling back to
+/// sniff mode, then to no capture at all. Never panics; on failure
+/// the caller falls back to counter mode with the returned reason.
+/// `blocked` is the shared set of lowercased exe paths the user
+/// blocked in the UI; the capture thread reads it on every packet.
 #[cfg(windows)]
-pub fn try_start() -> CaptureHandle {
+pub fn try_start(blocked: Arc<RwLock<HashSet<String>>>) -> CaptureHandle {
     use windivert::prelude::*;
 
-    // SNIFF: packets are copied, never diverted — the originals keep
-    // flowing untouched and no send() is ever needed. RECV_ONLY: this
-    // handle never injects anything.
-    let flags = WinDivertFlags::default().set_sniff().set_recv_only();
-    match WinDivert::network("true", 0, flags) {
+    let flow_map: FlowMap = Arc::new(RwLock::new(HashMap::new()));
+    // Flow handle is best-effort: if it fails, per-app rows stay
+    // empty but the total meter keeps working.
+    if let Ok(flow) = WinDivert::flow("true", 0, WinDivertFlags::default()) {
+        let map = flow_map.clone();
+        std::thread::spawn(move || flow_thread(flow, map));
+    }
+
+    // 1. Intercept mode: packets are held until we reinject them, so
+    //    blocked apps' packets can be dropped. This is the v0.3 path.
+    match WinDivert::network("true", 0, WinDivertFlags::default()) {
         Ok(divert) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || capture_thread(divert, tx));
+            std::thread::spawn(move || capture_thread(divert, tx, flow_map, blocked, true));
             CaptureHandle {
                 rx: Some(rx),
-                status: CaptureStatus::Active { packets: 0 },
+                status: CaptureStatus::Active {
+                    packets: 0,
+                    intercept: true,
+                },
             }
         }
         Err(e) => {
-            CaptureHandle::unavailable(format!("WinDivert failed: {e}. Run as administrator."))
+            // 2. Sniff fallback (v0.2 behaviour): copies only, no
+            //    blocking possible. Remember the reason for the UI.
+            let flags = WinDivertFlags::default().set_sniff().set_recv_only();
+            match WinDivert::network("true", 0, flags) {
+                Ok(divert) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        capture_thread(divert, tx, flow_map, blocked, false)
+                    });
+                    CaptureHandle {
+                        rx: Some(rx),
+                        status: CaptureStatus::Active {
+                            packets: 0,
+                            intercept: false,
+                        },
+                    }
+                }
+                Err(_) => CaptureHandle::unavailable(format!(
+                    "WinDivert failed: {e}. Run as administrator."
+                )),
+            }
         }
     }
 }
@@ -195,33 +397,152 @@ pub fn try_start() -> CaptureHandle {
 /// WinDivert is Windows-only; on other platforms capture is simply
 /// unavailable and the sampler uses counter mode.
 #[cfg(not(windows))]
-pub fn try_start() -> CaptureHandle {
+pub fn try_start(_blocked: Arc<RwLock<HashSet<String>>>) -> CaptureHandle {
     CaptureHandle::unavailable("WinDivert packet capture is only available on Windows.".to_string())
 }
 
-/// Blocking recv loop. Runs until the UI drops the receiver, or a recv
-/// error ends the handle — either way the sampler notices the channel
-/// closing and reports capture as stopped.
+/// Flow thread: maintains the live 5-tuple -> PID map. Runs until
+/// the handle errors or the process exits.
+#[cfg(windows)]
+fn flow_thread(divert: windivert::WinDivert<windivert::layer::FlowLayer>, flow_map: FlowMap) {
+    use windivert::prelude::*;
+    let mut endpoints: HashMap<u64, FlowKey> = HashMap::new();
+    let mut buf = vec![0u8; 1024];
+    while let Ok(packet) = divert.recv(Some(&mut buf[..])) {
+        let addr = &packet.address;
+        let key = FlowKey::new(
+            addr.protocol(),
+            addr.local_address(),
+            addr.local_port(),
+            addr.remote_address(),
+            addr.remote_port(),
+        );
+        match addr.event() {
+            WinDivertEvent::FlowStablished => {
+                endpoints.insert(addr.endpoint_id(), key);
+                if let Ok(mut map) = flow_map.write() {
+                    map.insert(key, addr.process_id());
+                }
+            }
+            WinDivertEvent::FlowDeleted => {
+                if let Some(old) = endpoints.remove(&addr.endpoint_id()) {
+                    if let Ok(mut map) = flow_map.write() {
+                        map.remove(&old);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Full exe path for a PID, via OpenProcess +
+/// QueryFullProcessImageName. Windows only; None if the process is
+/// gone or cannot be queried (e.g. a protected system process).
+#[cfg(windows)]
+fn exe_for_pid(pid: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        if result.is_err() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)] // Windows version is used on Windows; stub exists for tests
+fn exe_for_pid(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Blocking recv loop. In intercept mode every non-blocked packet is
+/// reinjected promptly with `send()`; blocked packets are dropped
+/// (never sent, never counted). In sniff mode packets are copies and
+/// `send()` is never called. Runs until the UI drops the receiver,
+/// or a recv error ends the handle — either way the sampler notices
+/// the channel closing and reports capture as stopped. If this thread
+/// dies for any reason, the WinDivert handle closes with it and all
+/// traffic flows normally again — blocking can never outlive the app.
 #[cfg(windows)]
 fn capture_thread(
     divert: windivert::WinDivert<windivert::layer::NetworkLayer>,
     tx: Sender<CaptureSnapshot>,
+    flow_map: FlowMap,
+    blocked: Arc<RwLock<HashSet<String>>>,
+    intercept: bool,
 ) {
     let mut counter = PacketCounter::new();
+    // PID -> exe path cache. A PID is only reused after its process
+    // exits, and a relaunched app usually has the same path, so a
+    // stale entry is harmless for a meter; failures (None) are cached
+    // too so system PIDs do not cost an OpenProcess per packet.
+    let mut exe_cache: HashMap<u32, Option<String>> = HashMap::new();
     // 64 KiB covers any IP packet (max 65535 bytes).
     let mut buf = vec![0u8; 65535];
     let mut last_send = Instant::now();
     while let Ok(packet) = divert.recv(Some(&mut buf[..])) {
-        // Localhost traffic can appear twice at this layer and
-        // is not internet traffic; skip it.
+        // Localhost traffic is not internet traffic. In intercept mode
+        // it must still be reinjected immediately, or local apps
+        // (and the loopback itself) would stall.
         if packet.address.loopback() {
+            if intercept {
+                let _ = divert.send(&packet);
+            }
             continue;
         }
-        counter.add(
-            packet.address.interface_index(),
-            packet.address.outbound(),
-            packet.data.len() as u64,
-        );
+        let outbound = packet.address.outbound();
+        let if_index = packet.address.interface_index();
+        let len = packet.data.len() as u64;
+        // Attribute the packet to an app, if its flow is known.
+        let exe: Option<String> = (|| {
+            let key = parse_flow_key(&packet.data, outbound)?;
+            let pid = flow_map.read().ok()?.get(&key).copied()?;
+            exe_cache
+                .entry(pid)
+                .or_insert_with(|| exe_for_pid(pid))
+                .clone()
+        })();
+        let is_blocked = match &exe {
+            Some(path) => blocked
+                .read()
+                .map(|set| should_drop(Some(path), &set))
+                .unwrap_or(false),
+            None => false,
+        };
+        if intercept {
+            if is_blocked {
+                // Drop: never reinjected, never counted. The app's
+                // packets simply never reach the network (outbound)
+                // or the app (inbound).
+                continue;
+            }
+            // Reinject promptly; if it fails, do not count a packet
+            // that never reached its destination.
+            if divert.send(&packet).is_err() {
+                continue;
+            }
+        }
+        counter.add(if_index, outbound, len);
+        match exe {
+            Some(path) => counter.add_app(&path, outbound, len),
+            None => counter.add_app(UNKNOWN_APP, outbound, len),
+        }
         // Send a snapshot at most every 100 ms. Sparse traffic
         // still sends promptly: after a packet, the elapsed time
         // since the last send is usually already > 100 ms.
@@ -309,14 +630,172 @@ mod tests {
     }
 
     #[test]
+    fn per_app_aggregation_by_exe_path() {
+        let mut c = PacketCounter::new();
+        c.add_app(r"C:\Program Files\Chrome\chrome.exe", false, 10_000);
+        c.add_app(r"C:\Program Files\Chrome\chrome.exe", true, 500);
+        c.add_app(r"C:\Windows\System32\svchost.exe", false, 2_000);
+        // Same exe, different connections: one row, totals summed.
+        assert_eq!(
+            c.app_totals(r"C:\Program Files\Chrome\chrome.exe"),
+            IfTotals {
+                down_bytes: 10_000,
+                up_bytes: 500
+            }
+        );
+        assert_eq!(
+            c.app_totals(r"C:\Windows\System32\svchost.exe"),
+            IfTotals {
+                down_bytes: 2_000,
+                up_bytes: 0
+            }
+        );
+        assert_eq!(c.app_totals(r"C:\nope.exe"), IfTotals::default());
+        let snap = c.snapshot();
+        assert_eq!(snap.apps.len(), 2);
+        assert_eq!(
+            snap.apps[r"C:\Program Files\Chrome\chrome.exe"].down_bytes,
+            10_000
+        );
+    }
+
+    #[test]
+    fn parse_flow_key_tcp_outbound_and_inbound() {
+        use etherparse::PacketBuilder;
+        let mut packet = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 5], [93, 184, 216, 34], 64)
+            .tcp(52341, 443, 1, 65535)
+            .write(&mut packet, &[1, 2, 3, 4])
+            .unwrap();
+        // Outbound: local = source.
+        let key = parse_flow_key(&packet, true).unwrap();
+        assert_eq!(key.protocol, 6);
+        assert_eq!(key.local, IpAddr::from([10, 0, 0, 5]));
+        assert_eq!(key.local_port, 52341);
+        assert_eq!(key.remote, IpAddr::from([93, 184, 216, 34]));
+        assert_eq!(key.remote_port, 443);
+        // Same packet seen inbound: local/remote swap.
+        let key_in = parse_flow_key(&packet, false).unwrap();
+        assert_eq!(key_in.local, IpAddr::from([93, 184, 216, 34]));
+        assert_eq!(key_in.remote, IpAddr::from([10, 0, 0, 5]));
+        assert_eq!(key_in.local_port, 443);
+    }
+
+    #[test]
+    fn parse_flow_key_udp_and_icmp() {
+        use etherparse::PacketBuilder;
+        let mut udp = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 5], [8, 8, 8, 8], 64)
+            .udp(53000, 53)
+            .write(&mut udp, &[1, 2])
+            .unwrap();
+        let key = parse_flow_key(&udp, true).unwrap();
+        assert_eq!(key.protocol, 17);
+        assert_eq!(key.local_port, 53000);
+        assert_eq!(key.remote_port, 53);
+        // ICMP has no transport ports: no flow key, but the bytes are
+        // still counted by the caller under UNKNOWN_APP.
+        let mut icmp = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 5], [8, 8, 8, 8], 64)
+            .icmpv4_echo_request(1, 1)
+            .write(&mut icmp, &[1, 2])
+            .unwrap();
+        assert!(parse_flow_key(&icmp, true).is_none());
+        // Garbage is not a packet.
+        assert!(parse_flow_key(&[1, 2, 3], true).is_none());
+    }
+
+    #[test]
+    fn flow_map_insert_lookup_delete() {
+        let map: FlowMap = Arc::new(RwLock::new(HashMap::new()));
+        let key = FlowKey::new(
+            6,
+            IpAddr::from([10, 0, 0, 5]),
+            52341,
+            IpAddr::from([93, 184, 216, 34]),
+            443,
+        );
+        {
+            let mut m = map.write().unwrap();
+            m.insert(key, 1234);
+        }
+        assert_eq!(map.read().unwrap().get(&key), Some(&1234));
+        {
+            let mut m = map.write().unwrap();
+            m.remove(&key);
+        }
+        assert!(map.read().unwrap().get(&key).is_none());
+    }
+
+    #[test]
+    fn should_drop_only_blocked_exes() {
+        let mut blocked = HashSet::new();
+        blocked.insert(r"c:\games\game.exe".to_string());
+        assert!(should_drop(Some(r"C:\Games\Game.exe"), &blocked));
+        assert!(!should_drop(Some(r"C:\Games\Other.exe"), &blocked));
+        // Unattributed packets are never dropped: dropping them could
+        // blackhole traffic the user never chose to block.
+        assert!(!should_drop(None, &blocked));
+        assert!(!should_drop(Some(r"C:\Games\Game.exe"), &HashSet::new()));
+    }
+
+    #[test]
+    fn mock_stream_reinject_vs_drop_counts() {
+        // Simulates the intercept loop over a mock packet stream.
+        let mut blocked = HashSet::new();
+        blocked.insert(r"c:\games\game.exe".to_string());
+        let stream: Vec<(Option<&str>, u64)> = vec![
+            (Some(r"C:\Games\Game.exe"), 1500),     // blocked: dropped
+            (Some(r"C:\Games\Game.exe"), 500),      // blocked: dropped
+            (Some(r"C:\Browser\chrome.exe"), 9000), // reinjected
+            (None, 200),                            // unattributed: reinjected
+            (Some(r"C:\Browser\chrome.exe"), 300),
+        ];
+        let (reinjected, dropped, bytes) = count_routed(&stream, &blocked);
+        assert_eq!(reinjected, 3);
+        assert_eq!(dropped, 2);
+        // Only reinjected bytes count: 9000 + 200 + 300.
+        assert_eq!(bytes, 9500);
+        // Every non-blocked packet is reinjected: nothing stalls.
+        let (all_re, all_drop, _) = count_routed(&stream, &HashSet::new());
+        assert_eq!(all_re, 5);
+        assert_eq!(all_drop, 0);
+    }
+
+    #[test]
     fn capture_status_labels() {
         assert_eq!(
-            CaptureStatus::Active { packets: 42 }.label(),
-            "Source: WinDivert packet capture — 42 packets seen"
+            CaptureStatus::Active {
+                packets: 42,
+                intercept: true
+            }
+            .label(),
+            "Source: WinDivert intercept — 42 packets seen (blocking active)"
         );
-        assert!(CaptureStatus::Active { packets: 0 }.is_active());
+        assert!(CaptureStatus::Active {
+            packets: 0,
+            intercept: true
+        }
+        .is_active());
+        assert!(CaptureStatus::Active {
+            packets: 0,
+            intercept: true
+        }
+        .can_block());
+        assert!(!CaptureStatus::Active {
+            packets: 0,
+            intercept: false
+        }
+        .can_block());
+        assert!(CaptureStatus::Active {
+            packets: 0,
+            intercept: false
+        }
+        .label()
+        .contains("sniff"));
         let s = CaptureStatus::Unavailable("WinDivert failed: x.".to_string());
         assert!(!s.is_active());
+        assert!(!s.can_block());
         assert!(s.label().contains("adapter counters (fallback)"));
     }
 
@@ -324,7 +803,7 @@ mod tests {
     fn fallback_when_windivert_unavailable() {
         // The decision the sampler makes: no capture handle -> counter
         // mode, and the reason is carried to the UI instead of failing.
-        let handle = try_start();
+        let handle = try_start(Arc::new(RwLock::new(HashSet::new())));
         #[cfg(not(windows))]
         {
             assert!(handle.rx.is_none());
