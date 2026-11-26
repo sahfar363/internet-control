@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.5.1.
+//! Internet Control — usage meter v0.5.2.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -16,6 +16,11 @@
 //! v0.5.1: when the window fails, the reason is shown as a banner
 //! at the top of the browser page, so the user can read it off the
 //! screen instead of hunting for the log file.
+//! v0.5.2: Minimal mode also shows the live 60-second download/
+//! upload graph, same lines and colours as full mode. The window
+//! also no longer gives up when registering the NavigationCompleted
+//! handler fails (0x8007139F) — it navigates anyway and only falls
+//! back to the browser if Navigate itself fails.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 

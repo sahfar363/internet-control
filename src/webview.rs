@@ -25,6 +25,87 @@
 //! v0.5.1: the `Err` string `run()` returns is the failure reason
 //! `main` records in the shared state, so the browser page can show
 //! it as a banner instead of the user hunting for the log file.
+//!
+//! v0.5.2: registering the `NavigationCompleted` handler can fail
+//! with ERROR_INVALID_STATE (0x8007139F) when the WebView2 browser
+//! process is not up yet at registration time. That is the browser
+//! process's state, not a wrong order on our side — the sequence
+//! (add, Navigate, wait, remove) matches the `webview2-com` crate's
+//! own sample, and `add_NavigationCompleted` is a thin COM call
+//! straight into Edge's implementation. `Navigate` is the call that
+//! (re)starts the browser process, so a failed registration is no
+//! longer fatal: the code navigates anyway, retries the registration
+//! once after navigating, and only falls back to the browser if
+//! `Navigate` itself fails. If the handler never registers, the
+//! window stays open without the page-loaded check instead of
+//! dropping to the browser. The keep-vs-fallback decision is the
+//! pure `decide_first_nav` below, unit tested without any COM.
+
+/// Plain-data outcome of the first navigation attempt (v0.5.2).
+///
+/// Deliberately platform-independent — no COM involved — so the
+/// keep-vs-fallback decision (`decide_first_nav`) is unit testable
+/// on any platform. `imp::WebView::run` (Windows-only) fills it in
+/// from the real calls.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirstNav {
+    /// `Navigate` itself failed, e.g. the webview is unusable.
+    NavigateFailed(String),
+    /// `Navigate` started but no `NavigationCompleted` handler could
+    /// be registered (registration failed twice), so the navigation
+    /// was never observed. This is NOT a failure: the page still
+    /// renders, so the window is kept.
+    Unobserved,
+    /// `NavigationCompleted` fired with `IsSuccess == true`.
+    Succeeded { http: i32 },
+    /// `NavigationCompleted` fired with `IsSuccess == false`.
+    Failed { web_error_status: i32, http: i32 },
+    /// `NavigationCompleted` never fired within the 15 s watchdog.
+    TimedOut,
+    /// The user closed the window while waiting for navigation
+    /// (`TaskCanceled` from `wait_with_pump`).
+    WaitCancelled,
+    /// The wait itself failed for another reason.
+    WaitFailed(String),
+}
+
+/// What to do after the first navigation attempt.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirstNavDecision {
+    /// Keep the app window open and run its message loop.
+    KeepWindow,
+    /// The window is already closed (user closed it while waiting):
+    /// exit cleanly. Must NOT enter the message loop — `wait_with_pump`
+    /// already consumed the WM_QUIT, so GetMessage would block forever.
+    ExitCleanly,
+    /// Close the window; the caller falls back to the browser.
+    /// Carries the reason string (banner / log).
+    Fallback(String),
+}
+
+/// Decide keep-vs-fallback after the first navigation attempt.
+/// Pure: no COM, no I/O.
+#[cfg(any(windows, test))]
+fn decide_first_nav(nav: &FirstNav) -> FirstNavDecision {
+    match nav {
+        FirstNav::NavigateFailed(e) => FirstNavDecision::Fallback(e.clone()),
+        FirstNav::Unobserved => FirstNavDecision::KeepWindow,
+        FirstNav::Succeeded { .. } => FirstNavDecision::KeepWindow,
+        FirstNav::Failed {
+            web_error_status,
+            http,
+        } => FirstNavDecision::Fallback(format!(
+            "WebView2 navigation failed (WebErrorStatus {web_error_status}, HTTP {http}); see internet-control.log"
+        )),
+        FirstNav::TimedOut => FirstNavDecision::Fallback(
+            "WebView2 navigation timed out after 15 s; see internet-control.log".to_string(),
+        ),
+        FirstNav::WaitCancelled => FirstNavDecision::ExitCleanly,
+        FirstNav::WaitFailed(e) => FirstNavDecision::Fallback(e.clone()),
+    }
+}
 
 #[cfg(windows)]
 mod imp {
@@ -248,81 +329,144 @@ mod imp {
             }
 
             let (tx, rx) = std::sync::mpsc::channel::<NavResult>();
-            // Watchdog: if NavigationCompleted never fires (the
-            // control can stall navigation while hidden or during a
-            // bad first run), stop waiting after 15 s instead of
-            // hanging on a white page forever.
-            {
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(15));
-                    let _ = tx.send(NavResult::Timeout);
-                });
-            }
+            let watchdog_tx = tx.clone();
             let handler =
                 NavigationCompletedEventHandler::create(Box::new(move |_sender, args| {
                     let _ = tx.send(Self::nav_outcome(args));
                     Ok(())
                 }));
             let mut token = 0;
-            let nav = (|| unsafe {
-                self.webview
-                    .add_NavigationCompleted(&handler, &mut token)
-                    .map_err(|e| format!("add_NavigationCompleted failed: {e:?}"))?;
+
+            // v0.5.2: registering the NavigationCompleted handler can
+            // fail with ERROR_INVALID_STATE (0x8007139F) when the
+            // WebView2 browser process is not up yet at registration
+            // time — the control itself is fine, and Navigate is the
+            // call that (re)starts the browser process. So a failed
+            // registration is NOT a window failure: log it and
+            // navigate anyway. (Our sequence matches the crate's own
+            // sample — add, Navigate, wait, remove — so this is the
+            // browser process's state, not a wrong order on our side.)
+            let mut handler_ok = unsafe {
+                match self.webview.add_NavigationCompleted(&handler, &mut token) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::log::log(&format!(
+                            "add_NavigationCompleted failed ({e:?}); navigating without the page-loaded check"
+                        ));
+                        false
+                    }
+                }
+            };
+
+            // Navigate anyway — this is what (re)starts the browser
+            // process. Only a failed Navigate means the window cannot
+            // show the page, and only then do we fall back.
+            let navigate_result = unsafe {
                 let target = CoTaskMemPWSTR::from(self.url.as_str());
                 self.webview
                     .Navigate(*target.as_ref().as_pcwstr())
-                    .map_err(|e| format!("Navigate failed: {e:?}"))?;
-                let result = webview2_com::wait_with_pump(rx);
-                let _ = self.webview.remove_NavigationCompleted(token);
-                result.map_err(|e| format!("waiting for navigation failed: {e:?}"))
-            })();
-            match nav {
-                Ok(NavResult::Done(true, _, http)) => {
-                    crate::log::log(&format!(
-                        "WebView2 navigation succeeded (HTTP {http}) for {}",
-                        self.url
-                    ));
+                    .map_err(|e| format!("Navigate failed: {e:?}"))
+            };
+
+            // If Navigate worked but the first registration failed,
+            // retry once: with the browser process up now, the
+            // handler usually registers on the second try and the
+            // watchdog below still applies.
+            if navigate_result.is_ok() && !handler_ok {
+                handler_ok = unsafe {
+                    match self.webview.add_NavigationCompleted(&handler, &mut token) {
+                        Ok(()) => {
+                            crate::log::log(
+                                "add_NavigationCompleted succeeded on retry after Navigate",
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            crate::log::log(&format!(
+                                "add_NavigationCompleted failed again after Navigate ({e:?}); continuing without the page-loaded check"
+                            ));
+                            false
+                        }
+                    }
+                };
+            }
+
+            // Plain-data outcome, then the pure keep-vs-fallback
+            // decision (see decide_first_nav above).
+            let first_nav = if let Err(e) = navigate_result {
+                crate::log::log(&format!("WebView2 Navigate failed: {e}"));
+                super::FirstNav::NavigateFailed(e)
+            } else if !handler_ok {
+                crate::log::log(
+                    "WebView2 navigation started without NavigationCompleted; keeping the app window open",
+                );
+                super::FirstNav::Unobserved
+            } else {
+                // Watchdog: if NavigationCompleted never fires (the
+                // control can stall navigation while hidden or during
+                // a bad first run), stop waiting after 15 s instead
+                // of hanging on a white page forever.
+                {
+                    let tx = watchdog_tx;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(15));
+                        let _ = tx.send(NavResult::Timeout);
+                    });
                 }
-                Ok(NavResult::Done(false, status, http)) => {
-                    crate::log::log(&format!(
-                        "WebView2 navigation FAILED: WebErrorStatus {status}, HTTP {http} for {}",
-                        self.url
-                    ));
+                let waited = webview2_com::wait_with_pump(rx);
+                let _ = unsafe { self.webview.remove_NavigationCompleted(token) };
+                match waited {
+                    Ok(NavResult::Done(true, _, http)) => {
+                        crate::log::log(&format!(
+                            "WebView2 navigation succeeded (HTTP {http}) for {}",
+                            self.url
+                        ));
+                        super::FirstNav::Succeeded { http }
+                    }
+                    Ok(NavResult::Done(false, status, http)) => {
+                        crate::log::log(&format!(
+                            "WebView2 navigation FAILED: WebErrorStatus {status}, HTTP {http} for {}",
+                            self.url
+                        ));
+                        super::FirstNav::Failed {
+                            web_error_status: status,
+                            http,
+                        }
+                    }
+                    Ok(NavResult::Timeout) => {
+                        crate::log::log(&format!(
+                            "WebView2 navigation timed out after 15 s for {}",
+                            self.url
+                        ));
+                        super::FirstNav::TimedOut
+                    }
+                    Err(e) => {
+                        // wait_with_pump reports TaskCanceled when the
+                        // message loop got WM_QUIT — i.e. the user
+                        // closed the window while navigation was
+                        // still running. That is a clean exit, not a
+                        // failure to fall back from.
+                        let e = format!("waiting for navigation failed: {e:?}");
+                        if e.contains("TaskCanceled") {
+                            super::FirstNav::WaitCancelled
+                        } else {
+                            crate::log::log(&format!("WebView2 navigation wait failed: {e}"));
+                            super::FirstNav::WaitFailed(e)
+                        }
+                    }
+                }
+            };
+            match super::decide_first_nav(&first_nav) {
+                super::FirstNavDecision::KeepWindow => self.message_loop(),
+                super::FirstNavDecision::ExitCleanly => Ok(()),
+                super::FirstNavDecision::Fallback(reason) => {
                     // A failed navigation leaves a blank white page.
                     // Close this window and let the caller fall back
                     // to the default browser on the same URL instead.
                     self.destroy_window();
-                    return Err(format!(
-                        "WebView2 navigation failed (WebErrorStatus {status}, HTTP {http}); see internet-control.log"
-                    ));
-                }
-                Ok(NavResult::Timeout) => {
-                    crate::log::log(&format!(
-                        "WebView2 navigation timed out after 15 s for {}",
-                        self.url
-                    ));
-                    self.destroy_window();
-                    return Err(
-                        "WebView2 navigation timed out after 15 s; see internet-control.log"
-                            .to_string(),
-                    );
-                }
-                Err(e) => {
-                    // wait_with_pump reports TaskCanceled when the
-                    // message loop got WM_QUIT — i.e. the user closed
-                    // the window while navigation was still running.
-                    // That is a clean exit, not a failure to fall
-                    // back from.
-                    if e.contains("TaskCanceled") {
-                        return Ok(());
-                    }
-                    crate::log::log(&format!("WebView2 navigation wait failed: {e}"));
-                    self.destroy_window();
-                    return Err(e);
+                    Err(reason)
                 }
             }
-            self.message_loop()
         }
 
         /// Close the frame window (used when navigation failed so no
@@ -458,4 +602,75 @@ pub fn run(url: &str) -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn run(_url: &str) -> Result<(), String> {
     Err("WebView2 is only available on Windows.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handler_failed_but_navigate_ok_keeps_window() {
+        // v0.5.2: the exact case from Sahand's banner —
+        // add_NavigationCompleted failed with 0x8007139F, but
+        // Navigate started. The window is kept, not dropped to the
+        // browser.
+        assert_eq!(
+            decide_first_nav(&FirstNav::Unobserved),
+            FirstNavDecision::KeepWindow
+        );
+    }
+
+    #[test]
+    fn navigate_failed_falls_back() {
+        assert_eq!(
+            decide_first_nav(&FirstNav::NavigateFailed(
+                "Navigate failed: Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }".to_string()
+            )),
+            FirstNavDecision::Fallback(
+                "Navigate failed: Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn navigation_outcomes_decide_as_before() {
+        assert_eq!(
+            decide_first_nav(&FirstNav::Succeeded { http: 200 }),
+            FirstNavDecision::KeepWindow
+        );
+        assert_eq!(
+            decide_first_nav(&FirstNav::Failed {
+                web_error_status: 12,
+                http: 0
+            }),
+            FirstNavDecision::Fallback(
+                "WebView2 navigation failed (WebErrorStatus 12, HTTP 0); see internet-control.log"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            decide_first_nav(&FirstNav::TimedOut),
+            FirstNavDecision::Fallback(
+                "WebView2 navigation timed out after 15 s; see internet-control.log".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn closing_window_while_waiting_exits_cleanly() {
+        // TaskCanceled must NOT enter the message loop (WM_QUIT was
+        // already consumed by the wait) and must NOT fall back.
+        assert_eq!(
+            decide_first_nav(&FirstNav::WaitCancelled),
+            FirstNavDecision::ExitCleanly
+        );
+        assert_eq!(
+            decide_first_nav(&FirstNav::WaitFailed(
+                "waiting for navigation failed: Error { code: HRESULT(0x80004005), message: \"Unspecified error\" }".to_string()
+            )),
+            FirstNavDecision::Fallback(
+                "waiting for navigation failed: Error { code: HRESULT(0x80004005), message: \"Unspecified error\" }".to_string()
+            )
+        );
+    }
 }

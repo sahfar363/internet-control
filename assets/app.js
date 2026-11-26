@@ -52,6 +52,11 @@
   });
 
   /* ---- overview ---- */
+  // v0.5.2: the graph is drawn in Minimal mode too — the canvas is
+  // visible there now (style.css keeps it at an explicit 120px), and
+  // render() calls drawGraph() on every poll either way. It reads
+  // clientWidth/clientHeight each time, so it also survives the
+  // canvas being re-shown after a mode toggle.
   function drawGraph() {
     var canvas = $("graph");
     if (!state) return;

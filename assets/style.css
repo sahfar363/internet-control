@@ -165,7 +165,9 @@ body {
   border-radius: 8px; padding: 9px 12px;
 }
 
-/* Minimal mode: ONLY big numbers, session totals and IP. */
+/* Minimal mode: big numbers, session totals, IP, and the live
+ * 60-second graph. Still no tabs, no per-app list, no adapters,
+ * no diagnostics. */
 .minimal-ip { display: none; color: var(--muted); margin: 8px 0; }
 .minimal-ip b { color: var(--text); }
 body.minimal .minimal-ip { display: block; }
@@ -173,7 +175,6 @@ body.minimal .tabs,
 body.minimal #tab-apps,
 body.minimal #tab-adapters,
 body.minimal .stats,
-body.minimal #graph,
 body.minimal .diagnostics,
 body.minimal .source-line,
 body.minimal #topNote,
@@ -181,3 +182,10 @@ body.minimal .topbar .startup,
 body.minimal main .small { display: none !important; }
 body.minimal #tab-overview { display: block; }
 body.minimal .bignum-value { font-size: 56px; }
+/* v0.5.2: the graph stays visible in Minimal mode and keeps its
+ * explicit 120px height, so the canvas can never collapse to 0
+ * while its siblings are hidden. `drawGraph()` in app.js already
+ * runs on every poll, so the lines stay live in both modes. The
+ * v0.5.1 window-failure banner (#windowBanner) is NOT in the hide
+ * list above, so it stays visible in Minimal mode too. */
+body.minimal #graph { display: block; height: 120px; }

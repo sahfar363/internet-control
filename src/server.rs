@@ -430,4 +430,59 @@ mod tests {
         let (header, _) = get(port, "/nope");
         assert!(header.contains("404"), "{header}");
     }
+
+    // v0.5.2: Minimal mode must keep the live download/upload graph
+    // (and the v0.5.1 window-failure banner). The graph used to be
+    // hidden by the Minimal hide-list in style.css, so pin the
+    // wiring on the embedded assets: the canvas exists in the page,
+    // the hide-list does not mention it or the banner, an explicit
+    // minimal-mode rule gives the canvas its 120px height, and the
+    // state JSON always carries the history the lines are drawn from.
+    #[test]
+    fn minimal_mode_keeps_graph_and_banner() {
+        assert!(
+            INDEX_HTML.contains("<canvas id=\"graph\""),
+            "index.html must contain the graph canvas"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"windowBanner\""),
+            "index.html must contain the window-failure banner"
+        );
+        // The Minimal hide-list is the selector list starting at
+        // `body.minimal .tabs,` and ending at the
+        // `{ display: none !important; }` rule. Neither the graph
+        // nor the banner may be among its selectors.
+        let hide_start = STYLE_CSS
+            .find("body.minimal .tabs,")
+            .expect("minimal hide-list must exist");
+        let hide_end = STYLE_CSS[hide_start..]
+            .find("{ display: none !important; }")
+            .expect("minimal hide rule must exist")
+            + hide_start;
+        let hide_list = &STYLE_CSS[hide_start..hide_end];
+        assert!(
+            !hide_list.contains("#graph"),
+            "minimal must not hide #graph"
+        );
+        assert!(
+            !hide_list.contains("windowBanner"),
+            "minimal must not hide #windowBanner"
+        );
+        assert!(
+            STYLE_CSS.contains("body.minimal #graph { display: block; height: 120px; }"),
+            "minimal mode must give the graph an explicit height"
+        );
+        assert!(
+            APP_JS.contains("drawGraph();"),
+            "render() must keep drawing the graph every poll"
+        );
+        // The history the lines are drawn from is served regardless
+        // of mode — minimal only changes what the page shows.
+        let shared = test_shared();
+        let port = serve(shared.clone()).unwrap();
+        let (_, body) = get(port, "/api/state");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("history_down").is_some(), "state has history_down");
+        assert!(v.get("history_up").is_some(), "state has history_up");
+    }
 }

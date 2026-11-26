@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.5.1)
+# Internet Control — Usage Meter (v0.5.2)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,30 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.5.2 changes (Minimal graph + window keeps trying when the page-loaded check fails)
+
+Minimal mode used to hide the 60-second graph — it showed only the
+big download/upload numbers, the session totals and the IP. v0.5.2
+keeps the live graph in Minimal mode too: same download (blue
+`#50B4FF`) and upload (orange `#FFAA3C`) lines, same 60-second
+window, updating every poll exactly like in full mode. Everything
+else about Minimal stays minimal — still no tabs, no per-app list,
+no adapters tab, no diagnostics — and the v0.5.1 window-failure
+banner still shows at the top in Minimal mode as well.
+
+The app window also no longer gives up when registering the
+`NavigationCompleted` handler fails. On some PCs that call fails
+with ERROR_INVALID_STATE (`0x8007139F`, "The group or resource is
+not in the correct state to perform the requested operation") —
+the WebView2 browser process is not up yet at that moment — and
+v0.5.1 treated it as a total window failure and fell back to the
+browser. v0.5.2 navigates anyway (`Navigate` is the call that
+(re)starts the browser process), retries the handler once after
+navigating, and only falls back to the browser if `Navigate`
+itself fails. If the handler never registers, the window stays
+open without the page-loaded check — the page renders when it
+renders — instead of dropping to the browser.
 
 ## What v0.5.1 changes (browser page shows why the app window failed)
 
@@ -106,6 +130,13 @@ was even shown. v0.4.1:
      reachable), 2 = connection aborted, 3 = timed out.
    - `WebView2 navigation timed out after 15 s` — navigation never
      finished; the browser fallback should have opened.
+   - `add_NavigationCompleted failed (...)` — the page-loaded check
+     could not be registered (usually `0x8007139F`, browser process
+     not up yet); since v0.5.2 the app navigates anyway and only
+     falls back if `Navigate` itself fails.
+   - `WebView2 navigation started without NavigationCompleted;
+     keeping the app window open` — the window is kept without the
+     check; the page renders when it renders.
    - `capture status: ...` — which mode the meter is in
      (intercept / sniff / counter fallback) and why.
 2. If the page opened in your **browser** instead of the app's
@@ -174,7 +205,8 @@ was even shown. v0.4.1:
   (cumulative down/up totals). Both columns exist in the data; the
   toggle chooses which the list is primarily sorted/shown by.
 - **Minimal toggle** — same app, shows ONLY the big download/upload
-  numbers, the session totals, and the IP.
+  numbers, the session totals, the IP, and the live 60-second
+  download/upload graph (since v0.5.2).
 
 Everything else is unchanged from v0.3: per-app attribution via the
 WinDivert FLOW layer plus the v0.5 table-based fallback map, ~1 s
@@ -282,7 +314,7 @@ instead.
   you close Internet Control.
 - Click a column header to sort the Apps list, or the **Rate /
   Total** toggle to switch views. The list never re-sorts by itself.
-- Click **Minimal** for the small view (usage + speed + IP only).
+- Click **Minimal** for the small view (usage + speed + IP + the live graph).
 
 ## Verification test — please do this
 
