@@ -1,14 +1,63 @@
-# Internet Control — Usage Meter (v0.5.5)
+# Internet Control — Usage Meter (v0.6.0)
 
-A Windows 10/11 (x64) internet usage meter in Rust with a modern
-WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
-download** — including over PDAnet phone tethering + VPN, where many
-other apps show 0 or double-count — plus a per-app list with
-block/unblock, like NetLimiter.
+A Windows 10/11 (x64) internet usage meter in Rust with a native
+egui UI (complete Rust, no WebView2/Edge) that shows **real, precise
+upload and download** — including over PDAnet phone tethering + VPN,
+where many other apps show 0 or double-count — plus a per-app list
+with block/unblock, like NetLimiter.
 
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.6.0 changes (back to native egui — no WebView2/Edge)
+
+v0.4–v0.5.5 tried an Edge/WebView2 window, but on Sahand's PC the
+embedded Edge process would not stay alive: every attempt failed
+at `Navigate` with `0x8007139F`, even with a fresh profile,
+`--disable-gpu` and `--no-sandbox` — while Edge itself opens
+Google fine. The old egui window (v0.3.0) always opened fine, so
+v0.6.0 goes back to a **native egui UI in complete Rust**
+(`src/app.rs`, `eframe` 0.32). No Edge, no browser, no local HTTP
+server, no `WebView2Loader.dll` in the zip. The WebView2 stack is
+gone: `src/webview.rs`, `src/server.rs` and `assets/` are deleted,
+and the `webview2-com` dependency is removed.
+
+Nothing about the meter changes: same WinDivert engine, same
+per-app attribution, same blocking — including terminating open
+connections at once (v0.5) — same top-numbers fallback and
+auto-switch, same Diagnostics. What the egui rebuild adds or
+carries over from the WebView UI:
+
+- **Dark / Light theme toggle at the top** (new) — switches the
+  whole window between egui dark and light visuals; the choice is
+  saved in `config.json` and restored next launch (dark by
+  default, also for configs written before v0.6.0).
+- **Tabs Overview / Apps / Adapters**, as in the WebView UI:
+  Overview has the big numbers, the 60-second graph and the
+  capture status; Apps has the per-app list with Block/Unblock,
+  the Rate/Total toggle and clickable sort headers; Adapters has
+  the adapter table (Select, IP, live rates, totals) and the
+  Diagnostics (raw per-interface capture totals, packets seen,
+  top-numbers source).
+- **Fixed columns** — numeric columns have fixed widths and use a
+  monospace font, so values never shift left/right as numbers
+  change (the v0.3 complaint). The app list keeps the bridge's
+  stable order: re-sorted only on header click or view toggle,
+  blocked apps pinned to the top with a BLOCKED badge.
+- **Scrolling** — the whole panel scrolls vertically, so nothing
+  is cut off when the window is short; the tables scroll
+  horizontally when the window is narrow.
+- **Resizable Minimal window** — the window is resizable in both
+  views (minimum 560×420). Minimal still shows only the big
+  numbers, the session totals, the IP and the live graph.
+- **IP in both views** — the carrying adapter's IP is shown under
+  the big numbers in normal and in Minimal view.
+- The termination note ("Terminated 3 open TCP connections for
+  chrome.exe") is shown under the Apps list, as before.
+- `internet-control.log` next to the exe is kept (the exe still
+  has no console window), with capture-status changes and Block
+  actions.
 
 ## What v0.5.5 changes (escalating window attempts + why the Edge process dies)
 
@@ -200,50 +249,20 @@ was even shown. v0.4.1:
   data from the local server — see internet-control.log next to the
   exe") instead of silently showing zeros.
 
-## If the window is white (or the page is empty)
+## If something looks wrong
 
 1. Close the app and look at **`internet-control.log` next to
    `internet-control.exe`** — send that file (or its last lines)
    with the report. The lines to look for:
-   - `UI server listening on http://127.0.0.1:<port>/` — the local
-     server started; if this line is missing, the server itself
-     failed to start.
-   - `WebView2 navigation succeeded (HTTP 200)` — the page loaded
-     in the Edge control.
-   - `WebView2 navigation FAILED: WebErrorStatus <n>, HTTP <n>` —
-     the page did not load in the control; the app should have
-     opened the same URL in your default browser instead. Common
-     WebErrorStatus values: 12 = cannot connect (server not
-     reachable), 2 = connection aborted, 3 = timed out.
-   - `WebView2 navigation timed out after 15 s` — navigation never
-     finished; the browser fallback should have opened.
-   - `add_NavigationCompleted failed (...)` — the page-loaded check
-     could not be registered (usually `0x8007139F`, browser process
-     not up yet); since v0.5.2 the app navigates anyway and only
-     falls back if `Navigate` itself fails.
-   - `WebView2 user data folder: ...` / `WebView2 runtime version:
-     <n>` — v0.5.3 logs the explicit profile folder
-     (`%LOCALAPPDATA%\InternetControl\WebView2`) and the Edge
-     version at startup. `not found` here means no WebView2
-     runtime is installed — install the Evergreen WebView2
-     Runtime.
-   - `WebView2 profile moved aside to ... after 0x8007139F;
-     retrying with a fresh profile` — v0.5.3 retried the window
-     once with a clean profile after an invalid-state failure. If
-     the next line is a navigation success, the stale profile was
-     the problem.
-   - `WebView2 navigation started without NavigationCompleted;
-     keeping the app window open` — the window is kept without the
-     check; the page renders when it renders.
    - `capture status: ...` — which mode the meter is in
      (intercept / sniff / counter fallback) and why.
-2. If the page opened in your **browser** instead of the app's
-   window, WebView2 itself failed — since v0.5.1 the reason is shown
-   as a banner at the top of the page itself ("The app window could
-   not open: …"), so read that off the screen first. The log lines
-   above still have the full detail, and make sure Edge is installed
-   (Windows 11 has the WebView2 runtime built in; on Windows 10 it
-   comes with Edge).
+   - `Block <exe>: ...` — what the last Block click terminated.
+2. If the top numbers read 0 while the Apps list moves, check the
+   Diagnostics on the Adapters tab (capture totals by interface
+   index, selected adapter, top-numbers source) — that is exactly
+   what this version is for.
+3. If the window itself does not open, the log file is the only
+   record — the exe has no console window.
 
 ## What v0.4 changes
 
@@ -371,12 +390,11 @@ meter shows 0. Counting the actual packets is the only way.
 
 ## Install
 
-1. Download `internet-control-v0.4.1-windows-x64.zip` from Releases.
+1. Download `internet-control-v0.6.0-windows-x64.zip` from Releases.
 2. Unzip it anywhere. **Keep all files together in the same folder**
    — the exe will not work properly on its own: `internet-control.exe`,
    `WinDivert.dll`, `WinDivert64.sys` (the WinDivert 2.2.2 driver
-   files — without them the meter falls back to counter mode) and
-   `WebView2Loader.dll` (lets the app find the Edge WebView2 runtime).
+   files — without them the meter falls back to counter mode).
 3. Run `internet-control.exe`. It asks for administrator rights
    (UAC prompt) — WinDivert needs them. If you decline, the app
    still opens but shows the counter fallback and the reason. **Run
@@ -384,10 +402,9 @@ meter shows 0. Counting the actual packets is the only way.
    WinDivert cannot open, packet counting does not start, and
    blocking does not work.
 
-No installer, no internet connection needed to run it. Windows 11
-has the WebView2 runtime built in; on Windows 10 it comes with
-Edge. Without the runtime the UI opens in your default browser
-instead.
+No installer, no internet connection needed to run it. No Edge or
+WebView2 runtime needed (v0.6.0 is native egui — nothing opens in
+a browser).
 
 ## How to use
 
@@ -413,6 +430,11 @@ instead.
 - Click a column header to sort the Apps list, or the **Rate /
   Total** toggle to switch views. The list never re-sorts by itself.
 - Click **Minimal** for the small view (usage + speed + IP + the live graph).
+  The Minimal window is resizable too — drag its edges like the normal one.
+- Click **Theme: Dark** / **Theme: Light** at the top to switch between
+  the dark and light theme. The choice is saved.
+- If the window is short, scroll down — the whole panel scrolls, so
+  nothing is cut off. The tables scroll sideways if the window is narrow.
 
 ## Verification test — please do this
 
@@ -448,22 +470,16 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 The binary is at `target\x86_64-pc-windows-msvc\release\internet-control.exe`.
 Copy `WinDivert.dll` and `WinDivert64.sys` from the same `x64` folder
-next to it before running. `WebView2Loader.dll` comes from the
-Microsoft.Web.WebView2 NuGet package (see `.github/workflows/release.yml`)
-— or from any Edge/WebView2 install — and goes next to the exe too.
-
-The WebView2 UI itself needs no SDK at build time: the
-`webview2-com` crate binds the COM APIs and loads
-`WebView2Loader.dll` at runtime only.
+next to it before running.
 
 `cargo test` runs the platform-independent unit tests (packet
 aggregation, rate math, counter-reset handling, formatting, the
 top-totals fallback, Unknown-interface rows, stable app-list
-ordering, Rate/Total view sorting, the local HTTP server) on any
-OS. `cargo check --target x86_64-pc-windows-msvc` needs
-`WINDIVERT_PATH` set as above. `cargo run` on Linux serves the UI
-on `http://127.0.0.1:<port>/` for a curl check (no live data —
-WinDivert is Windows-only).
+ordering, Rate/Total view sorting, the egui UI helpers) on any OS.
+`cargo check --target x86_64-pc-windows-msvc` needs
+`WINDIVERT_PATH` set as above. `cargo run` on Linux tries to open
+the egui window and fails without a display — that is expected;
+the engine tests are the Linux gate.
 
 ## License
 
@@ -471,6 +487,4 @@ MIT for the meter itself. The WinDivert driver files
 (`WinDivert.dll`, `WinDivert64.sys`) are from the official WinDivert
 2.2.2 release by Basil00 (https://reqrypt.org/windivert.html) and
 are covered by their own license — see the LICENSE file in the
-WinDivert zip. `WebView2Loader.dll` is from Microsoft's WebView2
-SDK (https://www.nuget.org/packages/Microsoft.Web.WebView2) and is
-covered by its own license.
+WinDivert zip.

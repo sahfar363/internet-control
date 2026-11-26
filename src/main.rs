@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.5.5.
+//! Internet Control — usage meter v0.6.0.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -10,52 +10,28 @@
 //! Falls back to sniff mode (counting only), then to the v0.1 counter
 //! mode, if WinDivert cannot be opened. Administrator rights required.
 //!
-//! v0.4 UI: a WebView2 (Edge) window showing a local page served by
-//! the loopback HTTP server in `server.rs`. If the WebView2 runtime
-//! is missing, the same page opens in the default browser instead.
-//! v0.5.1: when the window fails, the reason is shown as a banner
-//! at the top of the browser page, so the user can read it off the
-//! screen instead of hunting for the log file.
-//! v0.5.2: Minimal mode also shows the live 60-second download/
-//! upload graph, same lines and colours as full mode. The window
-//! also no longer gives up when registering the NavigationCompleted
-//! handler fails (0x8007139F) — it navigates anyway and only falls
-//! back to the browser if Navigate itself fails.
-//! v0.5.3: on Sahand's PC `Navigate` itself then failed with the
-//! same 0x8007139F, so the browser process never starts at all. The
-//! environment now uses an explicit user-data folder
-//! (`%LOCALAPPDATA%\InternetControl\WebView2`); when the window
-//! fails with 0x8007139F the stale profile is moved aside and the
-//! window is retried once with a fresh profile. The runtime version
-//! is logged at startup and appended to the failure reason, so the
-//! banner shows the Edge version too.
-//! v0.5.4: the v0.5.3 retry died at once with TaskCanceled — the
-//! stale WM_QUIT from attempt 1's destroyed window poisoned the
-//! retry's first message pump. Every attempt now drains stale
-//! WM_QUIT messages first, the retry pauses ~500 ms so a crashed
-//! Edge process can exit, and the banner lists what happened on
-//! every attempt.
-//! v0.5.5: the drain worked (no more TaskCanceled), but both
-//! attempts still fail at Navigate with the same 0x8007139F —
-//! Edge's browser process itself will not stay alive. The window
-//! now escalates across up to three attempts with a fresh profile
-//! each time: plain, then `--disable-gpu`, then
-//! `--disable-gpu --no-sandbox` (last resort, page is local-only).
-//! A ProcessFailed handler logs why the process died (kind /
-//! reason / exit code) so the cause stops being a guess.
+//! v0.6 UI: native egui (complete Rust, `src/app.rs`) — back from the
+//! WebView2 experiment. v0.4–v0.5.5 tried an Edge/WebView2 window, but
+//! on Sahand's PC the embedded Edge process would not stay alive
+//! (every attempt failed at Navigate with 0x8007139F, even with a
+//! fresh profile, --disable-gpu and --no-sandbox), while Edge itself
+//! works fine. The old egui window (v0.3.0) always opened fine, so
+//! the UI is native egui again — same WinDivert engine, same
+//! blocking (including terminating existing connections, v0.5),
+//! Minimal view with the live graph (v0.5.2), dark/light theme
+//! toggle, scrolling everywhere and a resizable Minimal window.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
 mod adapters;
+mod app;
 mod capture;
 mod connections;
 mod log;
 mod meter;
-mod server;
 mod startup;
 mod state;
 mod store;
-mod webview;
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -74,7 +50,7 @@ fn main() {
     let blocked_for_sampler = shared.blocked.clone();
     std::thread::spawn(move || adapters::sample_loop(tx, blocked_for_sampler));
 
-    // Bridge thread: batches -> the JSON snapshot the UI polls.
+    // Bridge thread: batches -> the snapshot the egui UI reads.
     let bridge_shared = shared.clone();
     std::thread::spawn(move || {
         let mut bridge = state::Bridge::new(bridge_shared);
@@ -83,68 +59,37 @@ fn main() {
         }
     });
 
-    let port = match server::serve(shared.clone()) {
-        Ok(port) => port,
-        Err(e) => {
-            // No console in a windows_subsystem build, so the log file
-            // is the only record of this failure.
-            log::log(&format!("FATAL: could not start the local UI server: {e}"));
-            eprintln!("Could not start the local UI server: {e}");
-            std::process::exit(1);
-        }
+    // Native egui window. Resizable in both views, with a sensible
+    // minimum size so the tables stay usable when small.
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Internet Control — Usage Meter")
+            .with_inner_size([980.0, 720.0])
+            .with_min_inner_size([560.0, 420.0])
+            .with_resizable(true),
+        ..Default::default()
     };
-    let url = format!("http://127.0.0.1:{port}/");
-    log::log(&format!("UI server listening on {url}"));
-
-    // WebView2 window (Windows). On any failure — no WebView2 runtime,
-    // no Edge, navigation failed — fall back to the default browser
-    // on the same URL.
-    match webview::run(&url) {
-        Ok(()) => {
-            log::log("window closed, saving config and exiting");
-        }
-        Err(e) => {
-            // v0.5.1: record the reason in the shared state BEFORE
-            // opening the browser, so the page itself can show it as
-            // a banner ("The app window could not open: …") instead
-            // of the user having to find internet-control.log. The
-            // string is the same one written to the log below,
-            // including WebErrorStatus / HRESULT where available.
-            if let Ok(mut slot) = shared.window_failure.lock() {
-                *slot = Some(e.clone());
-            }
-            log::log(&format!(
-                "WebView2 unavailable ({e}); opening the UI in the default browser: {url}"
-            ));
-            eprintln!("WebView2 unavailable ({e}); opening the UI in the default browser: {url}");
-            #[cfg(windows)]
-            open_in_browser(&url);
-            #[cfg(not(windows))]
-            println!("Open this URL in a browser: {url}");
-            // Park the process so the server (and the capture
-            // handle, i.e. blocking) stays alive while the browser
-            // tab is open. Ctrl+C / closing the terminal ends it.
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
-            }
-        }
+    let shared_for_ui = shared.clone();
+    if let Err(e) = eframe::run_native(
+        "Internet Control — Usage Meter",
+        options,
+        Box::new(move |cc| {
+            Ok(Box::new(app::MeterApp::new(shared_for_ui, cc)) as Box<dyn eframe::App>)
+        }),
+    ) {
+        // No console in a windows_subsystem build, so the log file
+        // is the only record of this failure.
+        log::log(&format!("FATAL: could not open the egui window: {e}"));
+        eprintln!("Could not open the egui window: {e}");
+        std::process::exit(1);
     }
 
     // Window closed: blocking ends with the process (the capture
     // handle closes), and the config is saved.
+    log::log("window closed, saving config and exiting");
     shared
         .store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .save();
-}
-
-/// Open `url` in the default browser (Windows fallback path).
-/// `rundll32 url.dll,FileProtocolHandler` is the plain std-only way
-/// to do it — no extra Win32 API surface needed.
-#[cfg(windows)]
-fn open_in_browser(url: &str) {
-    let _ = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
 }

@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(windows))]
 use crate::meter::civil_from_days;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// LUID of the selected adapter, if the user picked one explicitly.
     pub selected_luid: Option<u64>,
@@ -37,6 +37,28 @@ pub struct Config {
     /// Apps list view: Rate or Total (v0.4 toggle).
     #[serde(default)]
     pub app_view: crate::state::AppView,
+    /// Dark theme (v0.6). True = dark, false = light. Defaults to
+    /// dark for saved configs written before v0.6 (no field present).
+    #[serde(default = "default_true")]
+    pub dark_theme: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            selected_luid: None,
+            selected_name: None,
+            blocked_exes: Vec::new(),
+            run_on_startup: false,
+            minimal: false,
+            app_view: crate::state::AppView::default(),
+            dark_theme: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

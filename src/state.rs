@@ -355,23 +355,6 @@ pub fn block_state(blocked: bool, down_bps: f64, up_bps: f64) -> BlockState {
     }
 }
 
-/// Banner text for the browser UI when the app's own WebView2 window
-/// could not open (v0.5.1). `Some(text)` exactly when a failure
-/// reason was recorded — the banner shows only in the browser
-/// fallback, never when the page is inside the working app window.
-/// `None` when the window opened normally. Test-only: it pins the
-/// wording the page (`assets/app.js`) renders — the page composes
-/// the same sentence from `StateJson.window_failure`, so keep the
-/// two in sync.
-#[cfg(test)]
-pub fn window_failure_banner(failure: &Option<String>) -> Option<String> {
-    failure.as_ref().map(|reason| {
-        format!(
-            "The app window could not open: {reason} You are seeing the UI in your browser instead."
-        )
-    })
-}
-
 /// The per-app list with a STABLE row order: rows are keyed by exe
 /// path, updated in place on every tick, and re-sorted only when the
 /// user asks (header click / view toggle). This is what stops the
@@ -545,7 +528,7 @@ pub struct DiagnosticsJson {
     pub capture_label: String,
 }
 
-/// The whole UI state, serialized to JSON for `GET /api/state`.
+/// The whole UI state, read by the egui UI from the snapshot lock.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StateJson {
     pub version: String,
@@ -574,14 +557,6 @@ pub struct StateJson {
     /// What the last Block click did to the app's existing
     /// connections (v0.5 termination report), if any.
     pub block_note: Option<String>,
-    /// Why the app's own WebView2 window could not open (v0.5.1),
-    /// if it failed: the same reason written to
-    /// `internet-control.log` (WebErrorStatus / HRESULT included
-    /// where available). Set by `main` when it falls back to the
-    /// default browser, so the browser page can show the reason as
-    /// a banner instead of the user hunting for the log file.
-    /// `None` when the window opened normally.
-    pub window_failure: Option<String>,
     pub error: Option<String>,
 }
 
@@ -590,9 +565,9 @@ pub struct StateJson {
 // bridge thread reads
 // ---------------------------------------------------------------------------
 
-/// Handles shared between the sampler bridge thread and the HTTP
-/// server thread. The server never touches capture state directly —
-/// it writes requests here and the bridge applies them on the next
+/// Handles shared between the sampler bridge thread and the egui
+/// UI thread. The UI never touches capture state directly — it
+/// writes requests here and the bridge applies them on the next
 /// sample tick (~100 ms), which is also what resets smoothers and
 /// history when the selection changes.
 pub struct Shared {
@@ -609,12 +584,8 @@ pub struct Shared {
     pub sort_request: Mutex<Option<SortMode>>,
     pub startup_request: Mutex<Option<bool>>,
     /// Note from the last Block click (v0.5 termination report),
-    /// written by the HTTP server, read by the bridge.
+    /// written by the egui UI, read by the bridge.
     pub block_note: Mutex<Option<String>>,
-    /// WebView2 window failure reason (v0.5.1), written by `main`
-    /// when the window fails and it falls back to the browser,
-    /// read by the bridge. `None` while the window is fine.
-    pub window_failure: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -642,7 +613,6 @@ impl Shared {
             sort_request: Mutex::new(None),
             startup_request: Mutex::new(None),
             block_note: Mutex::new(None),
-            window_failure: Mutex::new(None),
         }
     }
 }
@@ -1077,12 +1047,6 @@ impl Bridge {
             )
         };
         let block_note = self.shared.block_note.lock().ok().and_then(|n| n.clone());
-        let window_failure = self
-            .shared
-            .window_failure
-            .lock()
-            .ok()
-            .and_then(|n| n.clone());
         let mut capture_totals: Vec<IfTotalJson> = batch
             .capture_totals
             .iter()
@@ -1189,7 +1153,6 @@ impl Bridge {
             sort_mode: self.app_list.sort(),
             selection_note: self.selection_note.clone(),
             block_note,
-            window_failure,
             error: self.error.clone(),
         };
         if let Ok(mut slot) = self.shared.snapshot.write() {
@@ -1576,69 +1539,5 @@ mod tests {
         assert_eq!(block_state(true, 0.0, 0.0), BlockState::Blocked);
         // Unblocked again: never "blocked" in any form.
         assert_eq!(block_state(false, 0.0, 0.0), BlockState::NotBlocked);
-    }
-
-    // --- window_failure banner (v0.5.1) ---------------------------------
-
-    #[test]
-    fn window_failure_banner_hidden_when_window_opened() {
-        // No failure recorded: the page is inside the working app
-        // window, so no banner.
-        assert_eq!(window_failure_banner(&None), None);
-    }
-
-    #[test]
-    fn window_failure_banner_shows_recorded_reason() {
-        let reason =
-            "WebView2 navigation failed (WebErrorStatus 12, HTTP 0); see internet-control.log"
-                .to_string();
-        let banner = window_failure_banner(&Some(reason)).unwrap();
-        assert!(
-            banner.starts_with("The app window could not open: "),
-            "{banner}"
-        );
-        assert!(banner.contains("WebErrorStatus 12"), "{banner}");
-        assert!(
-            banner.ends_with("You are seeing the UI in your browser instead."),
-            "{banner}"
-        );
-    }
-
-    #[test]
-    fn window_failure_defaults_to_none_in_snapshot() {
-        let shared = std::sync::Arc::new(Shared::new(Store::default()));
-        let mut bridge = Bridge::new(shared.clone());
-        bridge.apply(SampleBatch::default());
-        let snap = shared.snapshot.read().unwrap();
-        assert!(snap.window_failure.is_none());
-        // The JSON the page polls carries the field as null.
-        let json = serde_json::to_string(&*snap).unwrap();
-        assert!(json.contains("\"window_failure\":null"), "{json}");
-    }
-
-    #[test]
-    fn window_failure_round_trips_into_snapshot() {
-        let shared = std::sync::Arc::new(Shared::new(Store::default()));
-        {
-            let mut slot = shared.window_failure.lock().unwrap();
-            *slot = Some(
-                "WebView2 runtime not available: WindowsError(HRESULT 0x80040154)".to_string(),
-            );
-        }
-        let mut bridge = Bridge::new(shared.clone());
-        bridge.apply(SampleBatch::default());
-        let snap = shared.snapshot.read().unwrap();
-        let reason = snap.window_failure.clone().unwrap();
-        assert!(reason.contains("0x80040154"), "{reason}");
-        // The JSON the page polls carries the reason verbatim.
-        let json = serde_json::to_string(&*snap).unwrap();
-        assert!(
-            json.contains("\"window_failure\":\"WebView2 runtime not available"),
-            "{json}"
-        );
-        assert!(json.contains("0x80040154"), "{json}");
-        // The banner the page would show carries the same reason.
-        let banner = window_failure_banner(&snap.window_failure).unwrap();
-        assert!(banner.contains(&reason), "{banner}");
     }
 }

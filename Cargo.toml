@@ -1,11 +1,13 @@
 [package]
 name = "internet-control"
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.5.5). WebView2 UI, WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates and a Minimal view with the live graph."
+description = "Internet Control — precise Windows internet usage meter (v0.6.0). Native egui UI (complete Rust, no WebView2/Edge), WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates, Minimal view with the live graph, dark/light theme."
 license = "MIT"
 
 [dependencies]
+eframe = "0.32"
+egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # IP/TCP/UDP header parsing for per-app flow attribution (pure Rust,
@@ -16,28 +18,18 @@ etherparse = "0.13"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    # Gates MIB_IF_TABLE2 / GetIfTable2 / GetAdaptersAddresses inside
+    # the IpHelper module (the if-table types live behind Ndis).
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
-    "Win32_System_Com",
-    "Win32_System_LibraryLoader",
-    "Win32_Graphics_Gdi",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
 ] }
 # WinDivert 2.2 driver wrapper (stable 0.6.0; 0.7.x is beta). Needs the
 # WinDivert 2.2.2 driver files at build time via WINDIVERT_PATH, and
 # WinDivert.dll + WinDivert64.sys next to the exe at runtime.
 windivert = "0.6"
-# WebView2 (Edge) window for the v0.4 UI. Pure COM bindings over the
-# `windows` crate — no build-time SDK needed; WebView2Loader.dll is
-# shipped next to the exe by the release workflow (see README).
-# Runtime only: if the WebView2 runtime is missing the app falls back
-# to opening the local UI in the default browser.
-webview2-com = "0.39"
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 # Embeds the requireAdministrator manifest (build.rs, Windows host only).
