@@ -3,7 +3,7 @@
 # Workflows permission and the push will 403). Add it via the GitHub
 # web UI instead: repo -> Add file -> Create new file ->
 # .github/workflows/release.yml, paste this file.
-# Then create a tag v0.4.0 to trigger a release build.
+# Then create a tag v0.6.0 to trigger a release build.
 name: Release
 
 on:
@@ -33,29 +33,6 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip" -OutFile windivert.zip
           Expand-Archive -Path windivert.zip -DestinationPath windivert
           Add-Content -Path $env:GITHUB_ENV -Value "WINDIVERT_PATH=$PWD\windivert\WinDivert-2.2.2-A\x64"
-      # v0.4 needs WebView2Loader.dll next to the exe at runtime: the
-      # webview2-com crate loads it dynamically to find the Edge
-      # WebView2 runtime (no SDK needed at build time). It comes from
-      # Microsoft's WebView2 NuGet package; the x64 loader lives at
-      # runtimes/win-x64/native/WebView2Loader.dll inside the .nupkg.
-      # Verified 2026-11-26: 1.0.4370.26 is the latest stable.
-      # NOTE: run #4 failed because the exact-path guard missed the DLL
-      # after extraction on the runner, even though the path is correct
-      # in the package — so locate it by search instead of assuming the
-      # layout, and dump the extracted tree when it is not found.
-      - name: Download WebView2 loader DLL
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.4370.26" -OutFile webview2.nupkg
-          Expand-Archive -Path webview2.nupkg -DestinationPath webview2
-          $dll = Get-ChildItem -Path webview2 -Recurse -Filter WebView2Loader.dll |
-            Where-Object { $_.FullName -match 'win-x64|x64' } |
-            Select-Object -First 1
-          if (-not $dll) {
-            Get-ChildItem -Path webview2 -Recurse | Select-Object -First 40 FullName
-            throw "WebView2Loader.dll (x64) not found in the NuGet package"
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "WEBVIEW2_LOADER=$($dll.FullName)"
       - run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - name: Package zip
         shell: pwsh
@@ -65,19 +42,15 @@ jobs:
           Copy-Item target\x86_64-pc-windows-msvc\release\internet-control.exe dist\
           Copy-Item $env:WINDIVERT_PATH\WinDivert.dll dist\
           Copy-Item $env:WINDIVERT_PATH\WinDivert64.sys dist\
-          Copy-Item $env:WEBVIEW2_LOADER dist\
           Copy-Item README.md dist\
-          Compress-Archive -Path dist\* -DestinationPath "internet-control-v$version-windows-x64.zip"
-          Get-FileHash "internet-control-v$version-windows-x64.zip" -Algorithm SHA256 | Format-List
+          Compress-Archive -Path dist\* -DestinationPath "internet-control-$version-windows-x64.zip"
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: internet-control-v*-windows-x64.zip
+          files: internet-control-*-windows-x64.zip
           body: |
             Internet Control meter v${{ github.ref_name }} — Windows x64.
-            WebView2 UI (Overview / Apps / Adapters tabs), top-numbers
-            fallback + Diagnostics, stable app list with Rate/Total view.
+            Native egui UI (Overview / Apps / Adapters tabs), top-numbers fallback + Diagnostics, stable app list with Rate/Total view, dark/light theme, scrolling, resizable Minimal view.
             Unzip and run `internet-control.exe` as administrator (WinDivert needs it).
-            Keep WinDivert.dll, WinDivert64.sys and WebView2Loader.dll next to the exe.
-            Windows 11 has the WebView2 runtime built in; on Windows 10 it comes with Edge.
-            See README.md for the 100 MB verification test.
+            Keep WinDivert.dll and WinDivert64.sys next to the exe.
+            See README.md for details.
