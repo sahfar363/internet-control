@@ -80,6 +80,19 @@
 //! exit and release its locks, and records every attempt in the
 //! log and in the banner reason, so the next banner shows what
 //! happened on each try.
+//!
+//! v0.5.5: the v0.5.4 drain worked — the retry now actually runs
+//! (no more TaskCanceled) — but BOTH attempts still fail at
+//! Navigate with the same 0x8007139F, with the runtime present and
+//! current (158) and a fresh profile. So Edge's browser process
+//! itself will not stay alive on Sahand's PC: most likely it
+//! crashes at startup (GPU process) or is blocked (sandbox / AV).
+//! The window now escalates across up to three attempts: plain,
+//! then a fresh profile with `--disable-gpu`, then a fresh profile
+//! with `--disable-gpu --no-sandbox` (last resort — the page is
+//! local-only). A best-effort ProcessFailed handler is registered
+//! right after obtaining the CoreWebView2, so the log says why the
+//! process died (kind / reason / exit code) instead of guessing.
 
 /// Plain-data outcome of the first navigation attempt (v0.5.2).
 ///
@@ -163,13 +176,89 @@ fn is_invalid_state_error(reason: &str) -> bool {
     reason.to_ascii_lowercase().contains(HRESULT_INVALID_STATE)
 }
 
-/// Retry the window once with a fresh profile only for
-/// ERROR_INVALID_STATE, and only once — any other failure, or a
-/// second invalid-state failure, goes straight to the browser.
-/// Pure: no COM, no I/O.
+/// Maximum window attempts (v0.5.5).
 #[cfg(any(windows, test))]
-fn should_retry_window(reason: &str, already_retried: bool) -> bool {
-    !already_retried && is_invalid_state_error(reason)
+const MAX_WINDOW_ATTEMPTS: usize = 3;
+
+/// Additional browser arguments for window attempt N (1-based,
+/// v0.5.5). Attempt 1 is plain, exactly as before. Attempt 2 adds
+/// `--disable-gpu` — the browser process may be crashing in the
+/// GPU process. Attempt 3 adds `--no-sandbox` as well — a last
+/// resort for a sandbox / AV that kills the process; the page is
+/// local-only, so this is a diagnostic fallback for a window that
+/// otherwise cannot open at all. Pure: no COM, no I/O.
+#[cfg(any(windows, test))]
+fn browser_args_for_attempt(attempt_no: usize) -> &'static str {
+    match attempt_no {
+        2 => "--disable-gpu",
+        3 => "--disable-gpu --no-sandbox",
+        _ => "",
+    }
+}
+
+/// Retry the window with a fresh profile (and, from attempt 2,
+/// escalating browser arguments) only for ERROR_INVALID_STATE,
+/// and only up to MAX_WINDOW_ATTEMPTS attempts total — any other
+/// failure goes straight to the browser. Pure: no COM, no I/O.
+#[cfg(any(windows, test))]
+fn should_retry_window(reason: &str, attempts_used: usize) -> bool {
+    attempts_used < MAX_WINDOW_ATTEMPTS && is_invalid_state_error(reason)
+}
+
+/// One window attempt's outcome, for the banner history (v0.5.5).
+/// `args` is the additional browser arguments that attempt used
+/// ("" for the plain first attempt).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttemptRecord {
+    error: String,
+    args: &'static str,
+}
+
+/// `" [args: ...]"` suffix for the banner history, empty when the
+/// attempt used no additional browser arguments. Pure.
+#[cfg(any(windows, test))]
+fn args_suffix(args: &str) -> String {
+    if args.is_empty() {
+        String::new()
+    } else {
+        format!(" [args: {args}]")
+    }
+}
+
+/// Human-readable name for a COREWEBVIEW2_PROCESS_FAILED_KIND
+/// value (v0.5.5, for the ProcessFailed log lines). Pure.
+#[cfg(any(windows, test))]
+fn process_failed_kind_name(kind: i32) -> String {
+    match kind {
+        0 => "browser process exited".to_string(),
+        1 => "render process exited".to_string(),
+        2 => "render process unresponsive".to_string(),
+        3 => "frame render process exited".to_string(),
+        4 => "utility process exited".to_string(),
+        5 => "sandbox helper process exited".to_string(),
+        6 => "GPU process exited".to_string(),
+        7 => "PPAPI plugin process exited".to_string(),
+        8 => "PPAPI broker process exited".to_string(),
+        9 => "unknown process exited".to_string(),
+        other => format!("process kind {other}"),
+    }
+}
+
+/// Human-readable name for a COREWEBVIEW2_PROCESS_FAILED_REASON
+/// value (v0.5.5, for the ProcessFailed log lines). Pure.
+#[cfg(any(windows, test))]
+fn process_failed_reason_name(reason: i32) -> String {
+    match reason {
+        0 => "unexpected".to_string(),
+        1 => "unresponsive".to_string(),
+        2 => "terminated".to_string(),
+        3 => "crashed".to_string(),
+        4 => "launch failed".to_string(),
+        5 => "out of memory".to_string(),
+        6 => "profile deleted".to_string(),
+        other => format!("reason {other}"),
+    }
 }
 
 /// `%LOCALAPPDATA%\InternetControl\WebView2` — our own explicit
@@ -230,23 +319,29 @@ fn failure_with_runtime_info(reason: &str, runtime_version: Option<&str>) -> Str
 }
 
 /// Combine every attempt's failure into the final banner reason
-/// (v0.5.4), so the next banner shows what happened on each try.
-/// One attempt: its error unchanged. Several: the last error
-/// first, then the earlier attempts numbered in parentheses.
+/// (v0.5.4), so the next banner shows what happened on each try,
+/// including which additional browser arguments each attempt used
+/// (v0.5.5). One attempt: its error unchanged. Several: the last
+/// error first, then the earlier attempts numbered in parentheses.
 /// Pure: no COM, no I/O.
 #[cfg(any(windows, test))]
-fn format_attempt_history(attempts: &[String]) -> String {
+fn format_attempt_history(attempts: &[AttemptRecord]) -> String {
     match attempts.len() {
         0 => "WebView2 window failed".to_string(),
-        1 => attempts[0].clone(),
+        1 => format!("{}{}", attempts[0].error, args_suffix(attempts[0].args)),
         _ => {
             let last = attempts.last().expect("non-empty");
             let earlier: Vec<String> = attempts[..attempts.len() - 1]
                 .iter()
                 .enumerate()
-                .map(|(i, e)| format!("attempt {}: {e}", i + 1))
+                .map(|(i, a)| format!("attempt {}: {}{}", i + 1, a.error, args_suffix(a.args)))
                 .collect();
-            format!("{last} (earlier attempts: {})", earlier.join("; "))
+            format!(
+                "{}{} (earlier attempts: {})",
+                last.error,
+                args_suffix(last.args),
+                earlier.join("; ")
+            )
         }
     }
 }
@@ -255,6 +350,7 @@ fn format_attempt_history(attempts: &[String]) -> String {
 mod imp {
     use std::mem;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use webview2_com::Microsoft::Web::WebView2::Win32::*;
     use webview2_com::*;
@@ -337,6 +433,34 @@ mod imp {
         }
     }
 
+    /// Describe a ProcessFailed event as one loggable line
+    /// (v0.5.5): kind, reason and exit code, e.g. "browser process
+    /// exited (crashed, exit code -1073741819)". Reason and exit
+    /// code live on the Args2 interface and may be absent on older
+    /// runtimes — then they are left out rather than failing.
+    fn describe_process_failed(args: Option<ICoreWebView2ProcessFailedEventArgs>) -> String {
+        let Some(args) = args else {
+            return "process failed (no details)".to_string();
+        };
+        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(0);
+        let kind = unsafe { args.ProcessFailedKind(&mut kind) }
+            .map(|()| super::process_failed_kind_name(kind.0))
+            .unwrap_or_else(|_| "unknown process".to_string());
+        let mut reason = "unknown reason".to_string();
+        let mut exit = String::new();
+        if let Ok(args2) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+            let mut r = COREWEBVIEW2_PROCESS_FAILED_REASON(0);
+            if unsafe { args2.Reason(&mut r) }.is_ok() {
+                reason = super::process_failed_reason_name(r.0);
+            }
+            let mut code = 0i32;
+            if unsafe { args2.ExitCode(&mut code) }.is_ok() {
+                exit = format!(", exit code {code}");
+            }
+        }
+        format!("{kind} ({reason}{exit})")
+    }
+
     /// One window attempt: create the window + control on
     /// `user_data_folder` and run the first navigation. The caller
     /// (`run`, below) decides whether a failure is worth one retry
@@ -344,12 +468,13 @@ mod imp {
     pub fn run_once(
         url: &str,
         user_data_folder: &std::path::Path,
+        browser_args: &str,
     ) -> std::result::Result<(), String> {
         // v0.5.4: drain the stale WM_QUIT a previous attempt's
         // destroyed window left behind, or this attempt's first
         // `wait_for_async_operation` dies with TaskCanceled at once.
         drain_quit_messages();
-        let view = WebView::create(url, user_data_folder)?;
+        let view = WebView::create(url, user_data_folder, browser_args)?;
         view.run()
     }
 
@@ -358,6 +483,15 @@ mod imp {
         webview: Rc<ICoreWebView2>,
         frame: FrameWindow,
         url: String,
+        /// v0.5.5: short note left by the ProcessFailed handler
+        /// when Edge's browser process dies ("browser process
+        /// exited (crashed, exit code -1073741819)"), read by
+        /// `run()` when Navigate fails so the failure reason says
+        /// why the process died. `None` when no process failure
+        /// fired (the event is asynchronous, so the note is often
+        /// still empty when Navigate returns — the handler's log
+        /// line is the reliable record either way).
+        process_failed_note: Arc<Mutex<Option<String>>>,
     }
 
     #[derive(Clone)]
@@ -369,6 +503,7 @@ mod imp {
         pub fn create(
             url: &str,
             user_data_folder: &std::path::Path,
+            browser_args: &str,
         ) -> std::result::Result<WebView, String> {
             unsafe {
                 CoInitializeEx(None, COINIT_APARTMENTTHREADED)
@@ -416,7 +551,26 @@ mod imp {
             // closure is dropped after the call.
             let folder_wide: CoTaskMemPWSTR<'static> =
                 CoTaskMemPWSTR::from(user_data_folder.to_string_lossy().as_ref());
-            let no_options: Option<&ICoreWebView2EnvironmentOptions> = None;
+            // v0.5.5: additional browser arguments for the
+            // escalating attempts (--disable-gpu, then also
+            // --no-sandbox). Only when args are non-empty — the
+            // plain first attempt passes no options at all, exactly
+            // as before. The crate's options default pins the
+            // target runtime version to 145.0.3800.47, so clear it
+            // to empty (use whatever runtime is installed) instead
+            // of risking a failure on an older runtime. The options
+            // object is moved into the starter closure and lives
+            // until the Create call runs.
+            let options: Option<ICoreWebView2EnvironmentOptions> = if browser_args.is_empty() {
+                None
+            } else {
+                let opts = CoreWebView2EnvironmentOptions::default();
+                unsafe {
+                    opts.set_additional_browser_arguments(browser_args.to_string());
+                    opts.set_target_compatible_browser_version(String::new());
+                }
+                Some(opts.into())
+            };
             let environment = {
                 let (tx, rx) = std::sync::mpsc::channel();
                 CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
@@ -424,7 +578,7 @@ mod imp {
                         CreateCoreWebView2EnvironmentWithOptions(
                             PCWSTR::null(),
                             *folder_wide.as_ref().as_pcwstr(),
-                            no_options,
+                            options.as_ref(),
                             &handler,
                         )
                         .map_err(webview2_com::Error::WindowsError)
@@ -493,12 +647,42 @@ mod imp {
                     }
                 }
             }
+            // v0.5.5: best-effort ProcessFailed handler — when
+            // Edge's browser process dies, this is the only place
+            // that says why (kind / reason / exit code). Registered
+            // right after obtaining the CoreWebView2 so a crash at
+            // startup is caught too. Registration failure is
+            // non-fatal: the window works without it, we just lose
+            // the diagnosis. (The handler object is kept alive by
+            // COM: add_ProcessFailed AddRefs it, so the local below
+            // may drop at the end of create().)
+            let process_failed_note: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            {
+                let note = process_failed_note.clone();
+                let handler = ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
+                    let detail = describe_process_failed(args);
+                    crate::log::log(&format!("WebView2 process failed: {detail}"));
+                    if let Ok(mut slot) = note.lock() {
+                        *slot = Some(detail);
+                    }
+                    Ok(())
+                }));
+                let mut token = 0;
+                unsafe {
+                    if let Err(e) = webview.add_ProcessFailed(&handler, &mut token) {
+                        crate::log::log(&format!(
+                            "ProcessFailed handler registration failed ({e:?}); continuing without process-failure diagnosis"
+                        ));
+                    }
+                }
+            }
             let frame = FrameWindow { window: hwnd };
             let view = WebView {
                 controller: Rc::new(controller),
                 webview: Rc::new(webview),
                 frame,
                 url: url.to_string(),
+                process_failed_note,
             };
             set_window_webview(hwnd, Some(Box::new(view.clone_for_window())));
             Ok(view)
@@ -510,6 +694,7 @@ mod imp {
                 webview: self.webview.clone(),
                 frame: self.frame.clone(),
                 url: self.url.clone(),
+                process_failed_note: self.process_failed_note.clone(),
             }
         }
 
@@ -638,6 +823,17 @@ mod imp {
             // Plain-data outcome, then the pure keep-vs-fallback
             // decision (see decide_first_nav above).
             let first_nav = if let Err(e) = navigate_result {
+                // v0.5.5: if the ProcessFailed event already fired,
+                // say why the process died — that is the real reason
+                // Navigate failed. (The event is asynchronous, so the
+                // note is often still empty here; the handler's log
+                // line is the reliable record either way.)
+                let mut e = e;
+                if let Ok(slot) = self.process_failed_note.lock() {
+                    if let Some(note) = slot.as_ref() {
+                        e = format!("{e} (WebView2 process failed: {note})");
+                    }
+                }
                 crate::log::log(&format!("WebView2 Navigate failed: {e}"));
                 super::FirstNav::NavigateFailed(e)
             } else if !handler_ok {
@@ -853,6 +1049,14 @@ mod imp {
 /// attempt). Each attempt is logged, the retry pauses ~500 ms so
 /// a crashed Edge process can exit and release its locks, and the
 /// final reason lists what happened on every attempt.
+///
+/// v0.5.5: the drain worked (no more TaskCanceled), but both
+/// attempts still fail at Navigate with the same 0x8007139F — the
+/// browser process itself will not stay alive. The window now
+/// escalates across up to three attempts with a fresh profile
+/// each time: plain, then `--disable-gpu`, then
+/// `--disable-gpu --no-sandbox`. Any non-0x8007139F failure still
+/// falls back immediately with no further attempts.
 #[cfg(windows)]
 pub fn run(url: &str) -> Result<(), String> {
     let folder = imp::webview2_user_data_dir();
@@ -864,21 +1068,30 @@ pub fn run(url: &str) -> Result<(), String> {
     }
 
     let mut dir = folder;
-    let mut retried = false;
-    let mut attempts: Vec<String> = Vec::new();
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
     loop {
         let attempt_no = attempts.len() + 1;
+        // v0.5.5: escalating browser arguments — plain, then
+        // --disable-gpu, then --disable-gpu --no-sandbox.
+        let args = browser_args_for_attempt(attempt_no);
+        let args_note = if args.is_empty() {
+            String::new()
+        } else {
+            format!("; additional browser arguments: {args}")
+        };
         crate::log::log(&format!(
-            "WebView2 window attempt {attempt_no} (user data folder: {})",
+            "WebView2 window attempt {attempt_no} (user data folder: {}{args_note})",
             dir.display()
         ));
-        match imp::run_once(url, &dir) {
+        match imp::run_once(url, &dir, args) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 crate::log::log(&format!("WebView2 window attempt {attempt_no} failed: {e}"));
-                attempts.push(e.clone());
-                if should_retry_window(&e, retried) {
-                    retried = true;
+                attempts.push(AttemptRecord {
+                    error: e.clone(),
+                    args,
+                });
+                if should_retry_window(&e, attempts.len()) {
                     let ts = now_secs();
                     let backup = backup_dir_for(&dir, ts);
                     let renamed = std::fs::rename(&dir, &backup).is_ok();
@@ -996,18 +1209,20 @@ mod tests {
     }
 
     #[test]
-    fn navigate_invalid_state_falls_back_but_is_retried_once() {
+    fn navigate_invalid_state_falls_back_but_is_retried() {
         // v0.5.3: Sahand's exact banner — Navigate failed with
         // 0x8007139F. decide_first_nav still says fallback (the
         // window cannot show the page), but should_retry_window
-        // says the caller gets one retry with a fresh profile.
+        // says the caller gets retries with a fresh profile —
+        // v0.5.5: up to three attempts total, then it stops.
         let reason = "Navigate failed: Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }";
         assert_eq!(
             decide_first_nav(&FirstNav::NavigateFailed(reason.to_string())),
             FirstNavDecision::Fallback(reason.to_string())
         );
-        assert!(should_retry_window(reason, false));
-        assert!(!should_retry_window(reason, true));
+        assert!(should_retry_window(reason, 1));
+        assert!(should_retry_window(reason, 2));
+        assert!(!should_retry_window(reason, 3));
     }
 
     #[test]
@@ -1016,18 +1231,18 @@ mod tests {
         // not a stale-profile case and must never trigger a retry.
         assert!(!should_retry_window(
             "Navigate failed: Error { code: HRESULT(0x80004005), message: \"Unspecified error\" }",
-            false
+            1
         ));
         assert!(!should_retry_window(
             "WebView2 runtime not available: Error { code: HRESULT(0x80040154), message: \"Class not registered\" }",
-            false
+            1
         ));
         assert!(!is_invalid_state_error(
             "Navigate failed: Error { code: HRESULT(0x8007139E), message: \"Something else\" }"
         ));
         assert!(!should_retry_window(
             "WebView2 navigation timed out after 15 s; see internet-control.log",
-            false
+            1
         ));
         // Detection is case-insensitive: lower-case hex still matches.
         assert!(is_invalid_state_error("hresult(0x8007139f)"));
@@ -1087,12 +1302,13 @@ mod tests {
         // distinguishable from the 0x8007139F case.
         let reason = "WebView2 controller creation failed: TaskCanceled";
         assert!(!is_invalid_state_error(reason));
-        assert!(!should_retry_window(reason, false));
-        assert!(!should_retry_window(reason, true));
-        // The 0x8007139F case still retries once, as before.
+        assert!(!should_retry_window(reason, 1));
+        assert!(!should_retry_window(reason, 3));
+        // The 0x8007139F case still retries, up to three attempts.
         let invalid_state = "Navigate failed: Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" }";
-        assert!(should_retry_window(invalid_state, false));
-        assert!(!should_retry_window(invalid_state, true));
+        assert!(should_retry_window(invalid_state, 1));
+        assert!(should_retry_window(invalid_state, 2));
+        assert!(!should_retry_window(invalid_state, 3));
     }
 
     #[test]
@@ -1100,16 +1316,25 @@ mod tests {
         // v0.5.4: no attempts — placeholder, never an empty reason.
         assert_eq!(format_attempt_history(&[]), "WebView2 window failed");
         // One attempt: its error unchanged (banner text as before).
-        let one = vec!["Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string()];
+        let one = vec![AttemptRecord {
+            error: "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+            args: "",
+        }];
         assert_eq!(
             format_attempt_history(&one),
             "Navigate failed: Error { code: HRESULT(0x8007139F) }"
         );
-        // Two attempts (Sahand's v0.5.3 run): the last error first,
+        // Two attempts (Sahand's v0.5.4 run): the last error first,
         // the earlier attempt numbered in parentheses.
         let two = vec![
-            "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
-            "WebView2 controller creation failed: TaskCanceled".to_string(),
+            AttemptRecord {
+                error: "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+                args: "",
+            },
+            AttemptRecord {
+                error: "WebView2 controller creation failed: TaskCanceled".to_string(),
+                args: "",
+            },
         ];
         let history = format_attempt_history(&two);
         assert!(
@@ -1121,7 +1346,20 @@ mod tests {
             "{history}"
         );
         // Three attempts keep their order.
-        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let three = vec![
+            AttemptRecord {
+                error: "a".to_string(),
+                args: "",
+            },
+            AttemptRecord {
+                error: "b".to_string(),
+                args: "",
+            },
+            AttemptRecord {
+                error: "c".to_string(),
+                args: "",
+            },
+        ];
         assert_eq!(
             format_attempt_history(&three),
             "c (earlier attempts: attempt 1: a; attempt 2: b)"
@@ -1134,8 +1372,14 @@ mod tests {
         // so the banner shows both what happened on each try and
         // which Edge runtime is installed.
         let attempts = vec![
-            "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
-            "WebView2 controller creation failed: TaskCanceled".to_string(),
+            AttemptRecord {
+                error: "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+                args: "",
+            },
+            AttemptRecord {
+                error: "WebView2 controller creation failed: TaskCanceled".to_string(),
+                args: "",
+            },
         ];
         let reason =
             failure_with_runtime_info(&format_attempt_history(&attempts), Some("158.0.4370.33"));
@@ -1145,5 +1389,92 @@ mod tests {
             reason.ends_with("[WebView2 runtime 158.0.4370.33]"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn browser_args_escalate_per_attempt() {
+        // v0.5.5: plain, then --disable-gpu, then also --no-sandbox.
+        assert_eq!(browser_args_for_attempt(1), "");
+        assert_eq!(browser_args_for_attempt(2), "--disable-gpu");
+        assert_eq!(browser_args_for_attempt(3), "--disable-gpu --no-sandbox");
+        // No fourth attempt exists (the cap is three), so anything
+        // beyond the escalations is plain by definition.
+        assert_eq!(browser_args_for_attempt(4), "");
+        assert_eq!(browser_args_for_attempt(0), "");
+    }
+
+    #[test]
+    fn three_attempt_cap() {
+        // v0.5.5: an invalid-state failure escalates twice (three
+        // attempts total), then stops.
+        let reason = "Navigate failed: Error { code: HRESULT(0x8007139F) }";
+        assert!(should_retry_window(reason, 1));
+        assert!(should_retry_window(reason, 2));
+        assert!(!should_retry_window(reason, 3));
+        assert!(!should_retry_window(reason, 4));
+        // A non-invalid-state failure never escalates, at any count.
+        assert!(!should_retry_window(
+            "WebView2 controller creation failed: TaskCanceled",
+            1
+        ));
+        assert!(!should_retry_window(
+            "WebView2 navigation timed out after 15 s; see internet-control.log",
+            2
+        ));
+    }
+
+    #[test]
+    fn attempt_history_includes_args() {
+        // v0.5.5: the banner history shows which arguments each
+        // attempt used, so Sahand's next banner says whether the
+        // --disable-gpu / --no-sandbox tries helped.
+        let attempts = vec![
+            AttemptRecord {
+                error: "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+                args: "",
+            },
+            AttemptRecord {
+                error: "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+                args: "--disable-gpu",
+            },
+            AttemptRecord {
+                error: "Navigate failed: Error { code: HRESULT(0x8007139F) }".to_string(),
+                args: "--disable-gpu --no-sandbox",
+            },
+        ];
+        let history = format_attempt_history(&attempts);
+        // The last attempt (with --no-sandbox) comes first.
+        assert!(
+            history.starts_with(
+                "Navigate failed: Error { code: HRESULT(0x8007139F) } [args: --disable-gpu --no-sandbox]"
+            ),
+            "{history}"
+        );
+        // The plain first attempt carries no args suffix.
+        assert!(
+            history.contains("attempt 1: Navigate failed: Error { code: HRESULT(0x8007139F) };"),
+            "{history}"
+        );
+        // The --disable-gpu attempt is labelled with its args.
+        assert!(
+            history.contains(
+                "attempt 2: Navigate failed: Error { code: HRESULT(0x8007139F) } [args: --disable-gpu]"
+            ),
+            "{history}"
+        );
+    }
+
+    #[test]
+    fn process_failed_names() {
+        // v0.5.5: kind / reason numbers from the ProcessFailed
+        // event become readable words in the log.
+        assert_eq!(process_failed_kind_name(0), "browser process exited");
+        assert_eq!(process_failed_kind_name(6), "GPU process exited");
+        assert_eq!(process_failed_kind_name(5), "sandbox helper process exited");
+        assert_eq!(process_failed_kind_name(99), "process kind 99");
+        assert_eq!(process_failed_reason_name(3), "crashed");
+        assert_eq!(process_failed_reason_name(4), "launch failed");
+        assert_eq!(process_failed_reason_name(5), "out of memory");
+        assert_eq!(process_failed_reason_name(99), "reason 99");
     }
 }

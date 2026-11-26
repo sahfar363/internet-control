@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.5.4)
+# Internet Control — Usage Meter (v0.5.5)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,36 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.5.5 changes (escalating window attempts + why the Edge process dies)
+
+v0.5.4's WM_QUIT drain worked — the retry now actually runs, no
+more `TaskCanceled` — but on Sahand's PC BOTH attempts still fail
+at `Navigate` with the same `0x8007139F`, with the runtime present
+and current (158) and a fresh profile. So Edge's browser process
+itself will not stay alive: most likely it crashes at startup (the
+GPU process) or is blocked (sandbox / antivirus).
+
+The window now escalates across up to three attempts, each with
+its own fresh profile: plain, then `--disable-gpu`, then
+`--disable-gpu --no-sandbox`. The last one is a last resort — the
+page is local-only, so turning the sandbox off for a window that
+otherwise cannot open at all is a diagnostic fallback, not a
+general setting. Any failure other than `0x8007139F` still falls
+back to the browser at once, with no further attempts, and the
+banner history now shows which arguments each attempt used, e.g.
+`… [args: --disable-gpu]`.
+
+v0.5.5 also registers a `ProcessFailed` handler right after
+getting the WebView2 control, so the log finally says why the
+process died instead of guessing: `WebView2 process failed:
+browser process exited (crashed, exit code -1073741819)` — kind
+(`browser` / `GPU` / `render` / `sandbox helper` / …), reason
+(`crashed` / `launch failed` / `out of memory` / …) and exit code.
+If the event fires before `Navigate` returns, the note is also
+appended to the failure reason shown in the banner. Registering
+the handler is best-effort: if it fails, the window carries on
+without it and the log says so.
 
 ## What v0.5.4 changes (the retry no longer dies at once — stale WM_QUIT drained)
 

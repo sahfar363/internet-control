@@ -1,8 +1,8 @@
 [package]
 name = "internet-control"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
-description = "Internet Control — precise Windows internet usage meter (v0.5.4). WebView2 UI, WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates and a Minimal view with the live graph."
+description = "Internet Control — precise Windows internet usage meter (v0.5.5). WebView2 UI, WinDivert intercept packet counting with per-app traffic, block/unblock while running (existing connections terminated at once), smoother rates and a Minimal view with the live graph."
 license = "MIT"
 
 [dependencies]

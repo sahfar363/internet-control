@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.5.4.
+//! Internet Control — usage meter v0.5.5.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -35,6 +35,14 @@
 //! WM_QUIT messages first, the retry pauses ~500 ms so a crashed
 //! Edge process can exit, and the banner lists what happened on
 //! every attempt.
+//! v0.5.5: the drain worked (no more TaskCanceled), but both
+//! attempts still fail at Navigate with the same 0x8007139F —
+//! Edge's browser process itself will not stay alive. The window
+//! now escalates across up to three attempts with a fresh profile
+//! each time: plain, then `--disable-gpu`, then
+//! `--disable-gpu --no-sandbox` (last resort, page is local-only).
+//! A ProcessFailed handler logs why the process died (kind /
+//! reason / exit code) so the cause stops being a guess.
 //! The UI is a single window, offline — no internet needed for the
 //! UI itself.
 
