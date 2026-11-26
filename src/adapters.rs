@@ -13,9 +13,10 @@
 //! only way to see the traffic. Capture totals are cumulative per
 //! interface index, so the same `RateCalculator` math turns them into
 //! rates — and the `Total` column shows captured bytes instead of the
-//! frozen 0. If an interface index has no matching adapter, its traffic
-//! is shown as an "Unknown interface N" row so the top numbers never
-//! read 0 while packets are flowing.
+//! frozen 0. Interfaces WinDivert sees but enumeration does not list
+//! are merged in as "Unknown interface N" rows by
+//! `crate::state::merge_capture_readings`, so the top numbers never
+//! read 0 while packets are flowing (see `state::resolve_top`).
 //!
 //! Non-Windows builds provide stubs so `cargo test` runs on Linux.
 
@@ -24,8 +25,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::capture::{CaptureSnapshot, CaptureStatus};
+use crate::capture::{CaptureSnapshot, CaptureStatus, IfTotals};
 use crate::meter::RateCalculator;
+use crate::state::merge_capture_readings;
 
 #[allow(dead_code)] // fields are read by the UI on Windows; stubs on Linux
 #[derive(Debug, Clone, Default)]
@@ -50,7 +52,11 @@ pub struct AdapterReading {
     pub info: AdapterInfo,
     pub down_bps: f64,
     pub up_bps: f64,
+    /// Bytes in this tick (kept for the UI/tests; the bridge
+    /// derives session totals from cumulative totals instead).
+    #[allow(dead_code)]
     pub down_delta: u64,
+    #[allow(dead_code)]
     pub up_delta: u64,
 }
 
@@ -100,6 +106,13 @@ pub struct SampleBatch {
     /// Per-app traffic this session (empty in counter-fallback mode,
     /// where attribution is unavailable).
     pub apps: Vec<AppReading>,
+    /// Raw per-interface capture totals (interface index -> bytes),
+    /// straight from the capture thread. The UI diagnostics show this
+    /// map, and the top-totals fallback sums it. Empty in counter
+    /// mode (no capture running).
+    pub capture_totals: HashMap<u32, IfTotals>,
+    /// `capture_totals` summed over all interfaces.
+    pub capture_total_all: IfTotals,
 }
 
 #[allow(dead_code)] // used by the Windows enumeration path
@@ -175,6 +188,11 @@ mod win {
         ipv4: Option<String>,
         if_type: u32,
         oper_status: u32,
+        /// Interface index from GetAdaptersAddresses (IP_ADAPTER_ADDRESSES.IfIndex).
+        /// v0.4: PdaNet and other PPP/virtual adapters can be missing
+        /// from GetIfTable2 while present here — this index lets the
+        /// union below still list them (see enumerate_adapters).
+        if_index: u32,
     }
 
     fn adapters_addresses_meta() -> HashMap<u64, Meta> {
@@ -230,6 +248,7 @@ mod win {
                         ipv4,
                         if_type: a.IfType,
                         oper_status: a.OperStatus.0 as u32,
+                        if_index: a.Anonymous1.Anonymous.IfIndex,
                     },
                 );
                 cur = a.Next;
@@ -247,9 +266,13 @@ mod win {
             let rc = GetIfTable2(&mut table as *mut _);
             if rc != ERROR_SUCCESS || table.is_null() {
                 // Fallback: metadata only, counters unknown (0).
+                // v0.4: use the IfIndex from GetAdaptersAddresses —
+                // the old code left every adapter at index 0, so no
+                // capture total could ever match any adapter.
                 for (luid, m) in meta {
                     out.push(AdapterInfo {
                         luid,
+                        index: m.if_index,
                         name: m.friendly.clone(),
                         description: m.description,
                         if_type: m.if_type,
@@ -293,6 +316,31 @@ mod win {
                 });
             }
             FreeMibTable(table as *const std::ffi::c_void);
+            // v0.4 (root-cause fix #3): union with GetAdaptersAddresses.
+            // A PPP/virtual adapter (PdaNet) can be present in
+            // GetAdaptersAddresses but missing from GetIfTable2 — in
+            // v0.3 it then never appeared in the UI at all, and its
+            // traffic could not be matched to any adapter. Adapters
+            // only seen here get IfIndex from that call and unknown
+            // (0) counters; their traffic still shows via WinDivert.
+            for (luid, m) in &meta {
+                if out.iter().any(|a| a.luid == *luid) {
+                    continue;
+                }
+                out.push(AdapterInfo {
+                    luid: *luid,
+                    index: m.if_index,
+                    name: m.friendly.clone(),
+                    description: m.description.clone(),
+                    if_type: m.if_type,
+                    type_name: type_name(m.if_type),
+                    oper_status: m.oper_status,
+                    status_text: status_text(m.oper_status),
+                    ipv4: m.ipv4.clone(),
+                    in_octets: 0,
+                    out_octets: 0,
+                });
+            }
         }
         // Operational adapters first, then by name, so the live ones are
         // at the top of the list.
@@ -342,15 +390,9 @@ pub fn enumerate_adapters() -> Vec<AdapterInfo> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)] // used from Windows-only code in state.rs
 pub fn default_route_luid() -> Option<u64> {
     None
-}
-
-/// LUIDs for synthetic "Unknown interface N" rows. Real LUIDs never
-/// carry this prefix (ASCII "WDIV" in the high bytes), so a captured
-/// interface with no matching adapter can still be selected and shown.
-fn synthetic_luid(if_index: u32) -> u64 {
-    0x5744_4956_0000_0000u64 | if_index as u64
 }
 
 /// Background sampler: polls every 100 ms, computes per-adapter rates,
@@ -414,8 +456,20 @@ pub fn sample_loop(
         // Per-app readings for this tick (capture mode only; the
         // counter fallback has no attribution, so the list is empty).
         let mut app_readings: Vec<AppReading> = Vec::new();
+        // Raw capture totals for this tick (diagnostics + the
+        // top-totals fallback). Empty in counter mode.
+        let mut capture_totals: HashMap<u32, IfTotals> = HashMap::new();
+        let mut capture_total_all = IfTotals::default();
         if capture_status.is_active() {
             let snap = last_snapshot.clone().unwrap_or_default();
+            capture_totals = snap.totals.clone();
+            capture_total_all =
+                capture_totals
+                    .values()
+                    .fold(IfTotals::default(), |acc, t| IfTotals {
+                        down_bytes: acc.down_bytes + t.down_bytes,
+                        up_bytes: acc.up_bytes + t.up_bytes,
+                    });
             // Per-app rates from the cumulative per-app totals, with
             // the same RateCalculator math as the adapters. Not
             // filtered to any one interface: WinDivert sees WiFi,
@@ -437,46 +491,21 @@ pub fn sample_loop(
             }
             let live_apps: std::collections::HashSet<String> = snap.apps.keys().cloned().collect();
             app_calcs.retain(|exe, _| live_apps.contains(exe));
-            for info in &adapters {
-                let totals = snap.totals.get(&info.index).copied().unwrap_or_default();
-                let calc = capture_calcs.entry(info.index).or_default();
-                let s = calc.update(totals.down_bytes, totals.up_bytes, elapsed);
-                let mut info = info.clone();
+            // Merge enumerated adapters with capture totals (v0.4):
+            // every adapter gets a row, and a capture interface with
+            // no matching adapter becomes an "Unknown interface N"
+            // row instead of dropping its bytes. See
+            // state::merge_capture_readings (pure, unit-tested).
+            for merged in merge_capture_readings(&adapters, &snap.totals) {
+                let calc = capture_calcs.entry(merged.info.index).or_default();
+                let s = calc.update(merged.totals.down_bytes, merged.totals.up_bytes, elapsed);
+                let mut info = merged.info;
                 // Total column shows captured bytes, not the frozen
                 // standard counters.
-                info.in_octets = totals.down_bytes;
-                info.out_octets = totals.up_bytes;
+                info.in_octets = merged.totals.down_bytes;
+                info.out_octets = merged.totals.up_bytes;
                 readings.push(AdapterReading {
                     info,
-                    down_bps: s.down_bps,
-                    up_bps: s.up_bps,
-                    down_delta: s.down_delta,
-                    up_delta: s.up_delta,
-                });
-            }
-            // Interfaces WinDivert sees but GetIfTable2 does not list:
-            // show them as their own row instead of dropping the bytes.
-            for (idx, totals) in &snap.totals {
-                if totals.down_bytes == 0 && totals.up_bytes == 0 {
-                    continue;
-                }
-                if adapters.iter().any(|a| a.index == *idx) {
-                    continue;
-                }
-                let calc = capture_calcs.entry(*idx).or_default();
-                let s = calc.update(totals.down_bytes, totals.up_bytes, elapsed);
-                readings.push(AdapterReading {
-                    info: AdapterInfo {
-                        luid: synthetic_luid(*idx),
-                        index: *idx,
-                        name: format!("Unknown interface {idx}"),
-                        type_name: "Unknown".to_string(),
-                        oper_status: 1,
-                        status_text: "Up".to_string(),
-                        in_octets: totals.down_bytes,
-                        out_octets: totals.up_bytes,
-                        ..Default::default()
-                    },
                     down_bps: s.down_bps,
                     up_bps: s.up_bps,
                     down_delta: s.down_delta,
@@ -512,6 +541,8 @@ pub fn sample_loop(
                 at: Some(now),
                 capture_status: capture_status.clone(),
                 apps: app_readings,
+                capture_totals,
+                capture_total_all,
             })
             .is_err()
         {

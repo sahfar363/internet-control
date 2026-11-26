@@ -30,6 +30,13 @@ pub struct Config {
     /// created/deleted when this changes; see `crate::startup`.
     #[serde(default)]
     pub run_on_startup: bool,
+    /// Minimal view toggle (v0.3, kept in v0.4): only the big
+    /// download/upload numbers, session totals and IP.
+    #[serde(default)]
+    pub minimal: bool,
+    /// Apps list view: Rate or Total (v0.4 toggle).
+    #[serde(default)]
+    pub app_view: crate::state::AppView,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

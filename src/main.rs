@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-//! Internet Control — usage meter v0.3.
+//! Internet Control — usage meter v0.4.
 //!
 //! Windows 10/11 x64. Counts real download/upload by capturing packets
 //! with WinDivert in intercept mode — the standard adapter counters
@@ -9,44 +9,86 @@
 //! closes, the handle closes and all traffic flows normally again.
 //! Falls back to sniff mode (counting only), then to the v0.1 counter
 //! mode, if WinDivert cannot be opened. Administrator rights required.
+//!
+//! v0.4 UI: a WebView2 (Edge) window showing a local page served by
+//! the loopback HTTP server in `server.rs`. If the WebView2 runtime
+//! is missing, the same page opens in the default browser instead.
+//! The UI is a single window, offline — no internet needed for the
+//! UI itself.
 
 mod adapters;
-mod app;
 mod capture;
 mod meter;
+mod server;
 mod startup;
+mod state;
 mod store;
+mod webview;
 
-use std::collections::HashSet;
 use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-fn main() -> eframe::Result<()> {
-    let (tx, rx) = mpsc::channel();
-    // Blocked apps (lowercased exe paths), shared with the capture
-    // thread and restored from config; blocking only applies while
-    // this app is running.
+fn main() {
     let store = store::Store::load();
-    let blocked: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(
-        store
-            .config
-            .blocked_exes
-            .iter()
-            .map(|e| e.to_lowercase())
-            .collect(),
-    ));
-    let blocked_for_sampler = blocked.clone();
+    let shared = Arc::new(state::Shared::new(store));
+
+    // Sampler thread: WinDivert capture + 100 ms batches.
+    let (tx, rx) = mpsc::channel();
+    let blocked_for_sampler = shared.blocked.clone();
     std::thread::spawn(move || adapters::sample_loop(tx, blocked_for_sampler));
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 680.0])
-            .with_title("Internet Control — Usage Meter"),
-        ..Default::default()
+    // Bridge thread: batches -> the JSON snapshot the UI polls.
+    let bridge_shared = shared.clone();
+    std::thread::spawn(move || {
+        let mut bridge = state::Bridge::new(bridge_shared);
+        while let Ok(batch) = rx.recv() {
+            bridge.apply(batch);
+        }
+    });
+
+    let port = match server::serve(shared.clone()) {
+        Ok(port) => port,
+        Err(e) => {
+            eprintln!("Could not start the local UI server: {e}");
+            std::process::exit(1);
+        }
     };
-    eframe::run_native(
-        "Internet Control — Usage Meter",
-        options,
-        Box::new(|_cc| Ok(Box::new(app::MeterApp::new(rx, blocked)))),
-    )
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // WebView2 window (Windows). On any failure — no WebView2 runtime,
+    // no Edge — fall back to the default browser on the same URL.
+    match webview::run(&url) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("WebView2 unavailable ({e}); opening the UI in the default browser: {url}");
+            #[cfg(windows)]
+            open_in_browser(&url);
+            #[cfg(not(windows))]
+            println!("Open this URL in a browser: {url}");
+            // Park the process so the server (and the capture
+            // handle, i.e. blocking) stays alive while the browser
+            // tab is open. Ctrl+C / closing the terminal ends it.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+    }
+
+    // Window closed: blocking ends with the process (the capture
+    // handle closes), and the config is saved.
+    shared
+        .store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .save();
+}
+
+/// Open `url` in the default browser (Windows fallback path).
+/// `rundll32 url.dll,FileProtocolHandler` is the plain std-only way
+/// to do it — no extra Win32 API surface needed.
+#[cfg(windows)]
+fn open_in_browser(url: &str) {
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
 }

@@ -82,6 +82,9 @@ impl RateSmoother {
         self.value
     }
 
+    /// Current smoothed value (read by tests; production code
+    /// uses the return value of `update`).
+    #[allow(dead_code)]
     pub fn value(&self) -> f64 {
         self.value
     }
