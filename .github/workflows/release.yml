@@ -39,13 +39,23 @@ jobs:
       # Microsoft's WebView2 NuGet package; the x64 loader lives at
       # runtimes/win-x64/native/WebView2Loader.dll inside the .nupkg.
       # Verified 2026-11-26: 1.0.4370.26 is the latest stable.
+      # NOTE: run #4 failed because the exact-path guard missed the DLL
+      # after extraction on the runner, even though the path is correct
+      # in the package — so locate it by search instead of assuming the
+      # layout, and dump the extracted tree when it is not found.
       - name: Download WebView2 loader DLL
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.4370.26" -OutFile webview2.nupkg
           Expand-Archive -Path webview2.nupkg -DestinationPath webview2
-          if (-not (Test-Path webview\runtimes\win-x64\native\WebView2Loader.dll)) { throw "WebView2Loader.dll not found in the NuGet package" }
-          Add-Content -Path $env:GITHUB_ENV -Value "WEBVIEW2_LOADER=$PWD\webview2\runtimes\win-x64\native\WebView2Loader.dll"
+          $dll = Get-ChildItem -Path webview2 -Recurse -Filter WebView2Loader.dll |
+            Where-Object { $_.FullName -match 'win-x64|x64' } |
+            Select-Object -First 1
+          if (-not $dll) {
+            Get-ChildItem -Path webview2 -Recurse | Select-Object -First 40 FullName
+            throw "WebView2Loader.dll (x64) not found in the NuGet package"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "WEBVIEW2_LOADER=$($dll.FullName)"
       - run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - name: Package zip
         shell: pwsh
