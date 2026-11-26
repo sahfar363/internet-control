@@ -225,6 +225,21 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>) {
                 }
                 store.save();
             }
+            // v0.5: a Block click also terminates the app's EXISTING
+            // TCP connections at once (SetTcpEntry) instead of only
+            // dropping new ones — and the fallback map already drops
+            // its pre-existing flows. The result is shown as a note
+            // in the UI (and in the log). Unblock clears the note.
+            if block {
+                let report = crate::connections::terminate_app_connections(exe);
+                let note = report.summarize(&crate::adapters::display_name_for(exe));
+                crate::log::log(&format!("Block {exe}: {note}"));
+                if let Ok(mut n) = shared.block_note.lock() {
+                    *n = Some(note);
+                }
+            } else if let Ok(mut n) = shared.block_note.lock() {
+                *n = None;
+            }
             json(&mut stream, 200, "{\"ok\":true}");
         }
         "/api/select" => {

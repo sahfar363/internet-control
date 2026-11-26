@@ -331,7 +331,12 @@
     $("minimalAdapter").textContent = state.selected_name;
 
     var bn = $("blockNote");
-    if (!state.can_block) {
+    if (state.block_note) {
+      // v0.5: what the last Block click did to the app's existing
+      // connections (e.g. "Terminated 3 open TCP connections…").
+      bn.textContent = state.block_note;
+      bn.classList.remove("hidden");
+    } else if (!state.can_block) {
       bn.textContent = "Blocking is unavailable: WinDivert is not in intercept mode (sniff/counter mode). Restart the app as administrator so WinDivert can open in intercept mode.";
       bn.classList.remove("hidden");
     } else {

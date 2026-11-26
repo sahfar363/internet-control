@@ -332,11 +332,14 @@ pub enum BlockState {
     NotBlocked,
     /// Blocked and its traffic has stopped (rates are 0).
     Blocked,
-    /// Blocked, but its rates are still > 0: the flows it uses started
-    /// before this app launched, so their packets are unattributed and
-    /// cannot be dropped. New connections are blocked; the old ones
-    /// stop when the app reconnects. Shown as a distinct badge so the
-    /// UI never pretends a still-moving app is fully blocked.
+    /// Blocked, but its rates are still > 0: the flows it uses could
+    /// not be attributed or terminated (v0.5 terminates existing TCP
+    /// connections and drops pre-existing flows via the table-based
+    /// fallback map, so this is now the rare edge case — e.g. ICMP or
+    /// a flow the tables did not reveal). New connections are
+    /// blocked; the old ones stop when the app reconnects. Shown as
+    /// a distinct badge so the UI never pretends a still-moving app
+    /// is fully blocked.
     BlockedNewConnectionsOnly,
 }
 
@@ -551,6 +554,9 @@ pub struct StateJson {
     pub app_view: AppView,
     pub sort_mode: SortMode,
     pub selection_note: Option<String>,
+    /// What the last Block click did to the app's existing
+    /// connections (v0.5 termination report), if any.
+    pub block_note: Option<String>,
     pub error: Option<String>,
 }
 
@@ -577,6 +583,9 @@ pub struct Shared {
     pub view_request: Mutex<Option<AppView>>,
     pub sort_request: Mutex<Option<SortMode>>,
     pub startup_request: Mutex<Option<bool>>,
+    /// Note from the last Block click (v0.5 termination report),
+    /// written by the HTTP server, read by the bridge.
+    pub block_note: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -603,6 +612,7 @@ impl Shared {
             view_request: Mutex::new(None),
             sort_request: Mutex::new(None),
             startup_request: Mutex::new(None),
+            block_note: Mutex::new(None),
         }
     }
 }
@@ -1036,6 +1046,7 @@ impl Bridge {
                 store.config.run_on_startup,
             )
         };
+        let block_note = self.shared.block_note.lock().ok().and_then(|n| n.clone());
         let mut capture_totals: Vec<IfTotalJson> = batch
             .capture_totals
             .iter()
@@ -1141,6 +1152,7 @@ impl Bridge {
             app_view: self.app_list.view(),
             sort_mode: self.app_list.sort(),
             selection_note: self.selection_note.clone(),
+            block_note,
             error: self.error.clone(),
         };
         if let Ok(mut slot) = self.shared.snapshot.write() {
@@ -1505,5 +1517,27 @@ mod tests {
             block_state(true, 0.0, 5.0),
             BlockState::BlockedNewConnectionsOnly
         );
+    }
+
+    #[test]
+    fn blocked_state_transitions_to_fully_blocked_when_traffic_stops() {
+        // v0.5: a Block click terminates the app's existing TCP
+        // connections and the fallback map drops its pre-existing
+        // flows, so the rates fall to 0 and the badge must flip from
+        // "new connections only" to plain BLOCKED — the UI no longer
+        // claims the app is only half-blocked once it stops moving.
+        assert_eq!(
+            block_state(true, 250_000.0, 40_000.0),
+            BlockState::BlockedNewConnectionsOnly
+        );
+        // Traffic decaying after termination (smoother draining).
+        assert_eq!(
+            block_state(true, 12.0, 0.0),
+            BlockState::BlockedNewConnectionsOnly
+        );
+        // Stopped: fully blocked.
+        assert_eq!(block_state(true, 0.0, 0.0), BlockState::Blocked);
+        // Unblocked again: never "blocked" in any form.
+        assert_eq!(block_state(false, 0.0, 0.0), BlockState::NotBlocked);
     }
 }

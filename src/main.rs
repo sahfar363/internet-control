@@ -18,6 +18,7 @@
 
 mod adapters;
 mod capture;
+mod connections;
 mod log;
 mod meter;
 mod server;

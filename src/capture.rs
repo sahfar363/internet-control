@@ -6,7 +6,13 @@
 //! "PdaNet Broadband Connection" (PPP virtual adapter, 10.1.19.2) carries
 //! all the traffic. Counting the actual packets is the only way.
 //!
-//! v0.3 blocking (design change from Sahand, 2026-11-25): blocking is
+//! v0.5 blocking (Sahand, 2026-11-26): Block now also terminates
+//! the app's EXISTING TCP connections at once (`SetTcpEntry`, see
+//! `crate::connections`) and attributes pre-existing flows through
+//! a 5-tuple map rebuilt from the connection tables — so a blocked
+//! app's old flows are dropped too, not just its new ones. UDP has
+//! no terminate API; its pre-existing flows are dropped via the
+//! same fallback map, keyed by local socket.
 //! WinDivert intercept only — NO firewall rules are ever created, and
 //! nothing persists at system level. The network handle runs in
 //! intercept (non-sniff) mode: every packet is reinjected with
@@ -22,13 +28,16 @@
 //! events with ProcessId + 5-tuple. The capture thread maps each
 //! packet's 5-tuple (parsed with etherparse) to a PID through that
 //! live map, then PID -> exe path via OpenProcess +
-//! QueryFullProcessImageName. Flows that started before the app
-//! launched are not in the map until they reconnect, and ICMP /
-//! non-TCP-UDP packets have no flow at all — those bytes are still
-//! counted in the totals, under "Unknown (unattributed)", never lost.
-//! Attribution is best-effort and never breaks the total meter: if
-//! the flow handle fails, per-app rows are empty but the totals keep
-//! working exactly as in v0.2.
+//! QueryFullProcessImageName. v0.5 adds a fallback for flows that
+//! started before the app launched: a 5-tuple -> PID map rebuilt ~1/s
+//! from the connection tables (`crate::connections`), consulted when
+//! the FLOW layer has no entry — so pre-existing flows are attributed
+//! (and dropped when blocked) instead of falling under "Unknown".
+//! ICMP / non-TCP-UDP packets have no flow at all — those bytes are
+//! still counted in the totals, under "Unknown (unattributed)", never
+//! lost. Attribution is best-effort and never breaks the total meter:
+//! if the flow handle fails, per-app rows are empty but the totals
+//! keep working exactly as in v0.2.
 //!
 //! The pure aggregation (`PacketCounter`, `parse_flow_key`,
 //! `should_drop`, `count_routed`) has no WinDivert dependency and is
@@ -354,12 +363,23 @@ pub fn try_start(blocked: Arc<RwLock<HashSet<String>>>) -> CaptureHandle {
         std::thread::spawn(move || flow_thread(flow, map));
     }
 
+    // v0.5 fallback attribution: 5-tuple -> PID maps rebuilt ~1/s
+    // from the connection tables, so flows that started before this
+    // app launched are attributed (and dropped when blocked) even
+    // though the FLOW layer never saw them. UDP has no FLOW entry
+    // problem either way; the fallback covers it by local socket.
+    let tcp_fb = crate::connections::TcpFallbackMap::default();
+    let udp_fb = crate::connections::UdpFallbackMap::default();
+    crate::connections::spawn_refresh(tcp_fb.clone(), udp_fb.clone());
+
     // 1. Intercept mode: packets are held until we reinject them, so
     //    blocked apps' packets can be dropped. This is the v0.3 path.
     match WinDivert::network("true", 0, WinDivertFlags::default()) {
         Ok(divert) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || capture_thread(divert, tx, flow_map, blocked, true));
+            std::thread::spawn(move || {
+                capture_thread(divert, tx, flow_map, tcp_fb, udp_fb, blocked, true)
+            });
             CaptureHandle {
                 rx: Some(rx),
                 status: CaptureStatus::Active {
@@ -376,7 +396,7 @@ pub fn try_start(blocked: Arc<RwLock<HashSet<String>>>) -> CaptureHandle {
                 Ok(divert) => {
                     let (tx, rx) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
-                        capture_thread(divert, tx, flow_map, blocked, false)
+                        capture_thread(divert, tx, flow_map, tcp_fb, udp_fb, blocked, false)
                     });
                     CaptureHandle {
                         rx: Some(rx),
@@ -439,8 +459,9 @@ fn flow_thread(divert: windivert::WinDivert<windivert::layer::FlowLayer>, flow_m
 /// Full exe path for a PID, via OpenProcess +
 /// QueryFullProcessImageName. Windows only; None if the process is
 /// gone or cannot be queried (e.g. a protected system process).
+/// `pub(crate)` so `crate::connections` can resolve table PIDs.
 #[cfg(windows)]
-fn exe_for_pid(pid: u32) -> Option<String> {
+pub(crate) fn exe_for_pid(pid: u32) -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
@@ -484,6 +505,8 @@ fn capture_thread(
     divert: windivert::WinDivert<windivert::layer::NetworkLayer>,
     tx: Sender<CaptureSnapshot>,
     flow_map: FlowMap,
+    tcp_fb: crate::connections::TcpFallbackMap,
+    udp_fb: crate::connections::UdpFallbackMap,
     blocked: Arc<RwLock<HashSet<String>>>,
     intercept: bool,
 ) {
@@ -510,9 +533,17 @@ fn capture_thread(
         let if_index = packet.address.interface_index();
         let len = packet.data.len() as u64;
         // Attribute the packet to an app, if its flow is known.
+        // FLOW map first (live flows); on a miss, the v0.5 fallback
+        // maps from the connection tables (flows that started before
+        // this app launched, incl. UDP by local socket).
         let exe: Option<String> = (|| {
             let key = parse_flow_key(&packet.data, outbound)?;
-            let pid = flow_map.read().ok()?.get(&key).copied()?;
+            let pid = flow_map
+                .read()
+                .ok()?
+                .get(&key)
+                .copied()
+                .or_else(|| crate::connections::fallback_pid(&key, &tcp_fb, &udp_fb))?;
             exe_cache
                 .entry(pid)
                 .or_insert_with(|| exe_for_pid(pid))

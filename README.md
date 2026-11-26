@@ -1,4 +1,4 @@
-# Internet Control — Usage Meter (v0.4.1)
+# Internet Control — Usage Meter (v0.5.0)
 
 A Windows 10/11 (x64) internet usage meter in Rust with a modern
 WebView2 (Edge, HTML/CSS) UI that shows **real, precise upload and
@@ -9,6 +9,39 @@ block/unblock, like NetLimiter.
 This is step 2 of the Internet Control project. The meter is proven;
 v0.4 rebuilds the UI on WebView2 and fixes the v0.3 top-numbers bug.
 Speed limiting per app is the next step.
+
+## What v0.5.0 changes (Block terminates open connections)
+
+v0.4's Block only stopped **new** connections: flows that started
+before the app launched were unattributed (the WinDivert FLOW layer
+only sees flows established after launch), so their packets could
+not be dropped and the app showed "BLOCKED — NEW CONNECTIONS ONLY"
+while the old connection kept moving. v0.5.0 fixes that two ways:
+
+- **Block terminates the app's open TCP connections at once**
+  (`SetTcpEntry` with `DELETE_TCB` — the documented Windows way,
+  what TCPView does). The connection dies immediately, and if the
+  app reconnects afterwards, the new connection is caught by the
+  existing WinDivert drop. Needs admin — the app already requires
+  it. (IPv6 TCP has no `SetTcpEntry` in the Windows API, so those
+  connections are covered by the second mechanism instead.)
+- **Fallback attribution from the connection tables**: a background
+  thread rebuilds a 5-tuple → PID map from `GetExtendedTcpTable` +
+  `GetExtendedUdpTable` about once a second, and the capture thread
+  consults it when the FLOW layer has no entry — so pre-existing
+  flows (TCP and UDP, which has no terminate API at all) are
+  attributed and their packets dropped like any other blocked
+  packet. UDP sockets are keyed by local address + port.
+- The Apps tab shows what the Block click did ("Terminated 3 open
+  TCP connections for chrome.exe; 2 UDP flows will be dropped") and
+  the row flips to plain **BLOCKED** once its traffic stops.
+  "BLOCKED — NEW CONNECTIONS ONLY" now only appears for the rare
+  flow that genuinely cannot be attributed or terminated.
+
+Nothing about the blocking promise changes: still WinDivert
+intercept only, no firewall rules, blocking only while the app is
+running — close it and everything is back. Terminations are
+one-time actions on live sockets, not persistent rules.
 
 ## What v0.4.1 changes (white-page fix)
 
@@ -108,11 +141,14 @@ was even shown. v0.4.1:
   so Block is always clickable. Sorting happens only when you click
   a column header or the **View: Rate | Total** toggle. Blocked
   apps are pinned to the top with a BLOCKED badge and their rates
-  read 0. A blocked app whose traffic is still moving shows
-  **"BLOCKED — NEW CONNECTIONS ONLY"**: its flows started before
-  this app launched, so their packets cannot be dropped until the
-  app reconnects — the UI says so instead of pretending it is
-  fully blocked.
+  read 0. Since v0.5, Block also **terminates the app's open TCP
+  connections at once** and drops its pre-existing flows (via a
+  5-tuple map rebuilt from the connection tables), so a blocked app
+  normally flips straight to plain BLOCKED. A blocked app whose
+  traffic is still moving shows **"BLOCKED — NEW CONNECTIONS ONLY"**
+  only for the rare flow that cannot be attributed or terminated
+  (e.g. ICMP) — the UI says so instead of pretending it is fully
+  blocked.
 - **Rate / Total view toggle** — the Apps toolbar switches the list
   between Rate view (current down/up rates) and Total view
   (cumulative down/up totals). Both columns exist in the data; the
@@ -121,11 +157,13 @@ was even shown. v0.4.1:
   numbers, the session totals, and the IP.
 
 Everything else is unchanged from v0.3: per-app attribution via the
-WinDivert FLOW layer, ~1 s smoothed rates, exact per-app totals,
-run-on-startup (HKCU Run key), admin manifest, WinDivert 2.2.2
-driver in the zip. Blocking is still WinDivert intercept only — no
-firewall rules, blocking only while the app is running; close the
-app and blocked apps get their internet back.
+WinDivert FLOW layer plus the v0.5 table-based fallback map, ~1 s
+smoothed rates, exact per-app totals, run-on-startup (HKCU Run key),
+admin manifest, WinDivert 2.2.2 driver in the zip. Blocking is
+still WinDivert intercept only — no firewall rules, blocking only
+while the app is running; close the app and blocked apps get their
+internet back. Block also terminates open TCP connections at once
+(`SetTcpEntry`); that is a one-time action, not a persistent rule.
 
 ## Why v0.2 — the v0.1 counters were blind
 
@@ -216,8 +254,11 @@ instead.
   Adapters tab — PDAnet is usually the one whose traffic moves when
   you download something.
 - On the Apps tab, click **Block** next to an app to cut its
-  internet, **Unblock** to give it back. Blocked apps stay pinned at
-  the top (marked BLOCKED) even when idle. Blocking ends the moment
+  internet at once — its open TCP connections are terminated
+  immediately and its pre-existing flows are dropped, so the row
+  flips to BLOCKED instead of only stopping new connections.
+  **Unblock** gives it back. Blocked apps stay pinned at the top
+  (marked BLOCKED) even when idle. Blocking ends the moment
   you close Internet Control.
 - Click a column header to sort the Apps list, or the **Rate /
   Total** toggle to switch views. The list never re-sorts by itself.
